@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Buf {
+    float data[];
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    float s = data[tid];
+
+    float a0=s,      a1=s+0.1f, a2=s+0.2f, a3=s+0.3f, a4=s+0.4f,
+          a5=s+0.5f, a6=s+0.6f, a7=s+0.7f, a8=s+0.8f, a9=s+0.9f;
+
+    float b = 0.9999f;
+    float c = 0.0001f;
+
+    for (int i = 0; i < 4096; i++) {
+        a0 = a0*b+c; a1 = a1*b+c; a2 = a2*b+c; a3 = a3*b+c; a4 = a4*b+c;
+        a5 = a5*b+c; a6 = a6*b+c; a7 = a7*b+c; a8 = a8*b+c; a9 = a9*b+c;
+    }
+
+    data[tid] = (a0+a1+a2+a3+a4+a5+a6+a7+a8+a9) * 0.1f;
+}

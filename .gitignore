@@ -1,0 +1,30 @@
+bench
+build/
+*.dSYM/
+.DS_Store
+
+# Generated model files (python3 scripts/gen_npu_model.py models/)
+models/
+
+# Tool / editor config
+.serena/
+.claude/
+.codex/
+CLAUDE.md
+compile_commands.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local credentials
+.env
+.env.*
+
+# Compiled CoreML models (generated at runtime)
+*.mlmodelc/
+notes
+
+# Local benchmark results
+/STATS.md

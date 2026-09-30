@@ -1,0 +1,16 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) buffer Data { uint data[]; };
+layout(set = 0, binding = 1) buffer Result { uint result[]; };
+
+layout(push_constant) uniform Params { uint num_chases; };
+
+void main() {
+    uint p = 0;
+    for (uint i = 0; i < num_chases; i++) {
+        p = data[p];
+    }
+    result[0] = p;
+}
