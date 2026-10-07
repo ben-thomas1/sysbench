@@ -1,0 +1,10 @@
+option('march', type: 'string', value: 'native',
+  description: 'Target CPU for -march (e.g. native, x86-64, x86-64-v3, x86-64-v4)')
+option('blas', type: 'feature', value: 'auto',
+  description: 'Linux: OpenBLAS for the matrix section')
+option('openvino', type: 'feature', value: 'auto',
+  description: 'Linux: OpenVINO C API for the npu section')
+option('openvino_include', type: 'string', value: '',
+  description: 'Linux: OpenVINO include dir, for SDKs without a pkg-config file')
+option('openvino_libdir', type: 'string', value: '',
+  description: 'Linux: OpenVINO library dir containing libopenvino_c')

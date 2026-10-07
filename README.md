@@ -9,15 +9,26 @@ Written in C23, with Objective-C for Metal and Core ML.
 
 Build on the machine you want to measure. The default `-march=native` selects
 that machine's instructions; the binary is not portable to older CPUs.
-A current Clang with C23 support is required (Apple Clang 21 is verified).
+A current Clang with C23 support is required (Apple Clang 21 and clang 19 are
+verified). The build uses Meson and Ninja; `make` targets wrap them:
+
+| Command | Result |
+|---------|--------|
+| `make release` | optimized build in `build/release/`, linked as `./bench` — use this for numbers |
+| `make` | debug build with sanitizers and strict warnings, linked as `./bench-debug` |
+| `make smoke` | x86-64 Linux build and run inside Docker (build/run check only) |
+| `make clean` | remove `build/` and the links |
+
+Pass `-Dmarch=<cpu>` to `meson setup` to target something other than `native`.
 
 ### macOS
 
-Install Xcode Command Line Tools, then build:
+Install Xcode Command Line Tools and Meson, then build:
 
 ```sh
 xcode-select --install
-make -j
+brew install meson ninja
+make release
 ```
 
 Metal, Foundation, Core ML, and Accelerate are supplied by macOS.
@@ -26,8 +37,8 @@ The Core ML Neural Engine mode requires macOS 13 or newer.
 ### Arch Linux (Intel)
 
 ```sh
-sudo pacman -S --needed base-devel clang python shaderc vulkan-headers vulkan-icd-loader vulkan-intel
-make -j
+sudo pacman -S --needed base-devel clang meson ninja python shaderc vulkan-headers vulkan-icd-loader vulkan-intel
+make release
 ```
 
 `shaderc` supplies `glslc`, which compiles the Vulkan shaders during the build.
@@ -40,7 +51,7 @@ OpenBLAS is optional:
 ```sh
 sudo pacman -S --needed openblas
 make clean
-make -j
+make release
 ```
 
 The build detects OpenBLAS with `pkg-config`. Install a C23-capable compiler
@@ -56,8 +67,12 @@ Run from the repository root so generated NPU models can be found:
 ./bench --only cpu,gpu
 ./bench --only branch
 ./bench --skip disk,npu
+./bench --repeat 5      # each section 5 times; median/min/max
 ./bench --help
 ```
+
+Values tagged `[peak]` are hardware ceilings, `[effective]` are nominal work
+divided by time, and `[estimate]` depend on stated assumptions.
 
 The full suite normally takes about one to two minutes on recent laptops.
 Run on AC power with other demanding applications idle when comparing results.
@@ -98,8 +113,9 @@ Python version; newer Python versions may lack native coremltools wheels.
 ```sh
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python coremltools==9.0 numpy
-.venv/bin/python scripts/gen_npu_model.py models/
-make -j
+.venv/bin/python tools/gen_npu_model.py models/
+make clean
+make release
 ./bench --only npu
 ```
 
@@ -122,8 +138,10 @@ For an SDK without that file, pass its actual include and library paths:
 
 ```sh
 make clean
-make -j OPENVINO_CFLAGS='-I/path/to/openvino/runtime/include' \
-  OPENVINO_LIBS='-L/path/to/openvino/runtime/lib/intel64 -Wl,-rpath,/path/to/openvino/runtime/lib/intel64 -lopenvino_c'
+meson setup build/release --buildtype=release -Db_lto=true -Db_pie=true \
+  -Dopenvino_include=/path/to/openvino/runtime/include \
+  -Dopenvino_libdir=/path/to/openvino/runtime/lib/intel64
+make release
 ```
 
 Generate the Linux model using NumPy only:
@@ -131,7 +149,7 @@ Generate the Linux model using NumPy only:
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install numpy
-.venv/bin/python scripts/gen_openvino_model.py models/
+.venv/bin/python tools/gen_openvino_model.py models/
 ./bench --only npu
 ```
 

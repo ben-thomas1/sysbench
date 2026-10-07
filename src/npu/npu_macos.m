@@ -121,7 +121,7 @@ void bench_npu(void) {
         }
         if (!model_path) {
             printf("  Model not found, skipping\n");
-            printf("  (generate with: python3 scripts/gen_npu_model.py models/)\n");
+            printf("  (generate with: python3 tools/gen_npu_model.py models/)\n");
             return;
         }
 

@@ -1,0 +1,6 @@
+build/
+bench
+bench-debug
+.git/
+*.dSYM/
+models/

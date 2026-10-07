@@ -168,7 +168,7 @@ void bench_npu(void) {
     FILE *f = fopen("models/npu_bench.xml", "r");
     if (!f) {
         printf("  Model not found, skipping\n");
-        printf("  (generate with: python3 scripts/gen_openvino_model.py models/)\n");
+        printf("  (generate with: python3 tools/gen_openvino_model.py models/)\n");
         return;
     }
     fclose(f);
