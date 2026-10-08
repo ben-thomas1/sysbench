@@ -1,246 +1,267 @@
-#include "bench.h"
-#include "timer.h"
+/* NPU section, Linux: OpenVINO C API inference of the generated MatMul model
+ * on NPU / GPU (when listed) and CPU. Builds without OpenVINO as a skip. */
+#include "npu/npu.h"
+#include "core/report.h"
+#include "core/stats.h"
+#include "core/timer.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #ifdef HAS_OPENVINO
 
 #include <openvino/c/openvino.h>
 
-#define NPU_MATMUL_SIZE 512
-#define NPU_NUM_LAYERS 10
-#define NPU_INPUT_ELEMS (NPU_MATMUL_SIZE * NPU_MATMUL_SIZE)
-#define NPU_OPS_PER_INFERENCE (NPU_NUM_LAYERS * 2ULL * NPU_MATMUL_SIZE * NPU_MATMUL_SIZE * NPU_MATMUL_SIZE)
-#define TARGET_NS 2000000000ULL
+/* Must match tools/gen_openvino_model.py. */
+#define MM_SIZE        512
+#define MM_LAYERS      10
+#define MM_OPS         ((u64)MM_LAYERS * 2ULL * MM_SIZE * MM_SIZE * MM_SIZE)
+#define MODEL_XML      "models/npu_bench.xml"
+#define MODEL_BIN      "models/npu_bench.bin"
 
-static const char *status_info(ov_status_e status) {
-    const char *info = ov_get_error_info(status);
-    return info ? info : "unknown error";
+#define WINDOW_NS      2'000'000'000ULL
+#define MIN_WARMUP     3
+#define MIN_INFER      5
+#define MAX_INFER      4096
+
+typedef struct {
+    const char *device;   /* OpenVINO device name */
+    bool        always;   /* run even if not listed (CPU) */
+} ov_target;
+
+static const ov_target targets[] = {
+    { "NPU", false },
+    { "GPU", false },
+    { "CPU", true  },
+};
+
+typedef struct {
+    f64 tops;
+    f64 inf_per_sec;
+    f64 ms_median;
+} infer_result;
+
+static const char *ov_err(ov_status_e st) {
+    const char *info = ov_get_error_info(st);
+    return info != NULL ? info : "unknown error";
 }
 
-static double run_inference_bench(ov_core_t *core, ov_model_t *model,
-                                  const char *device, size_t *out_passes,
-                                  char *err, size_t err_len) {
-    ov_compiled_model_t *compiled = NULL;
-    ov_infer_request_t *request = NULL;
-    ov_tensor_t *input_tensor = NULL;
-    ov_output_const_port_t *input_port = NULL;
-    ov_shape_t shape = {0};
-    double result = -1.0;
-    ov_status_e status = OK;
+/* Time synchronous inferences on one device. `lat` holds MAX_INFER samples. */
+static sb_status_e time_infer(ov_infer_request_t *req, f64 *lat, infer_result *out) {
+    u32 warm = 0;
+    u64 w0   = sb_timer_now_ns();
+    while (warm < MIN_WARMUP || sb_timer_now_ns() - w0 < SB_WARMUP_NS) {
+        if (ov_infer_request_infer(req) != OK) { return SB_ERR_IO; }
+        warm++;
+    }
 
-    if (err && err_len > 0) err[0] = '\0';
+    u32 n  = 0;
+    u64 t0 = sb_timer_now_ns();
+    u64 t1 = t0;
+    while (n < MAX_INFER && (n < MIN_INFER || t1 - t0 < WINDOW_NS)) {
+        u64 a = sb_timer_now_ns();
+        if (ov_infer_request_infer(req) != OK) { return SB_ERR_IO; }
+        t1       = sb_timer_now_ns();
+        lat[n++] = (f64)(t1 - a);
+    }
+    if (t1 <= t0) { return SB_ERR_RANGE; }
 
-    status = ov_model_const_input(model, &input_port);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "model input: %s", status_info(status));
+    sb_stats    st;
+    sb_status_e s = sb_stats_compute(lat, n, &st);
+    if (s != SB_OK) { return s; }
+    out->inf_per_sec = (f64)n / ((f64)(t1 - t0) / 1e9);
+    out->tops        = (f64)MM_OPS * out->inf_per_sec / 1e12;
+    out->ms_median   = st.median / 1e6;
+    return SB_OK;
+}
+
+/* Compile for `device`, set a filled input tensor, time it. Errors that come
+ * from OpenVINO are printed as an info line with the device name. */
+static sb_status_e run_device(ov_core_t *core, const ov_model_t *model, const char *device,
+                              f64 *lat, infer_result *out) {
+    sb_status_e             s        = SB_OK;
+    ov_status_e             st       = OK;
+    const char             *what     = NULL;
+    ov_output_const_port_t *port     = NULL;
+    ov_shape_t              shape    = { 0 };
+    ov_tensor_t            *tensor   = NULL;
+    ov_compiled_model_t    *compiled = NULL;
+    ov_infer_request_t     *req      = NULL;
+    char                   *prec     = NULL;
+    f32                    *data     = NULL;
+    ov_element_type_e       type     = F32;
+
+    st = ov_model_const_input(model, &port);
+    if (st != OK) { what = "model input"; goto ov_fail; }
+    st = ov_const_port_get_shape(port, &shape);
+    if (st != OK) { what = "input shape"; goto ov_fail; }
+    st = ov_port_get_element_type(port, &type);
+    if (st != OK) { what = "input type"; goto ov_fail; }
+    if (type != F32 || shape.rank != 2 || shape.dims[0] != MM_SIZE || shape.dims[1] != MM_SIZE) {
+        sb_report_info("%s: expected an f32 [%d,%d] input; regenerate with gen_openvino_model.py",
+                       device, MM_SIZE, MM_SIZE);
+        s = SB_ERR_INVALID;
         goto cleanup;
     }
 
-    status = ov_const_port_get_shape(input_port, &shape);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "input shape: %s", status_info(status));
-        goto cleanup;
+    st = ov_tensor_create(F32, shape, &tensor);
+    if (st != OK) { what = "input tensor"; goto ov_fail; }
+    st = ov_tensor_data(tensor, (void **)&data);
+    if (st != OK || data == NULL) { what = "tensor data"; goto ov_fail; }
+    for (u32 i = 0; i < MM_SIZE * MM_SIZE; i++) { data[i] = 0.001f * (f32)(i % 1024); }
+
+    /* One property = two variadic arguments (key, value). */
+    st = ov_core_compile_model(core, model, device, 2, &compiled,
+                               ov_property_key_hint_performance_mode, "LATENCY");
+    if (st != OK) { what = "compile"; goto ov_fail; }
+    if (ov_compiled_model_get_property(compiled, ov_property_key_hint_inference_precision, &prec) == OK &&
+        prec != NULL) {
+        sb_report_info("%s: inference precision %s", device, prec);
     }
 
-    ov_element_type_e input_type;
-    status = ov_port_get_element_type(input_port, &input_type);
-    if (status != OK || input_type != F32 || shape.rank != 2 ||
-        shape.dims[0] != NPU_MATMUL_SIZE || shape.dims[1] != NPU_MATMUL_SIZE) {
-        if (err) snprintf(err, err_len,
-                          "expected float32 [512,512]; regenerate with gen_openvino_model.py");
-        goto cleanup;
-    }
+    st = ov_compiled_model_create_infer_request(compiled, &req);
+    if (st != OK) { what = "infer request"; goto ov_fail; }
+    st = ov_infer_request_set_input_tensor(req, tensor);
+    if (st != OK) { what = "set input tensor"; goto ov_fail; }
 
-    status = ov_tensor_create(F32, shape, &input_tensor);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "input tensor: %s", status_info(status));
-        goto cleanup;
-    }
+    s = time_infer(req, lat, out);
+    goto cleanup;
 
-    /* Fill input */
-    float *data = NULL;
-    status = ov_tensor_data(input_tensor, (void **)&data);
-    if (status != OK || !data) {
-        if (err) snprintf(err, err_len, "tensor data: %s", status_info(status));
-        goto cleanup;
-    }
-    for (int i = 0; i < NPU_INPUT_ELEMS; i++)
-        data[i] = 0.001f * (float)i;
-
-    status = ov_core_compile_model(core, model, device, 0, &compiled);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "compile on %s: %s", device, status_info(status));
-        goto cleanup;
-    }
-
-    status = ov_compiled_model_create_infer_request(compiled, &request);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "infer request: %s", status_info(status));
-        goto cleanup;
-    }
-
-    status = ov_infer_request_set_input_tensor(request, input_tensor);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "set input tensor: %s", status_info(status));
-        goto cleanup;
-    }
-
-    /* Warmup */
-    for (int w = 0; w < 3; w++) {
-        status = ov_infer_request_infer(request);
-        if (status != OK) {
-            if (err) snprintf(err, err_len, "warmup infer: %s", status_info(status));
-            goto cleanup;
-        }
-    }
-
-    /* Calibrate */
-    uint64_t tc0 = timer_ns();
-    status = ov_infer_request_infer(request);
-    if (status != OK) {
-        if (err) snprintf(err, err_len, "calibration infer: %s", status_info(status));
-        goto cleanup;
-    }
-    uint64_t tc1 = timer_ns();
-    uint64_t one_pass = tc1 - tc0;
-    size_t passes = 1;
-    if (one_pass > 0) passes = (size_t)(TARGET_NS / one_pass) + 1;
-    if (passes < 2) passes = 2;
-
-    /* Timed run */
-    uint64_t t0 = timer_ns();
-    for (size_t p = 0; p < passes; p++) {
-        status = ov_infer_request_infer(request);
-        if (status != OK) {
-            if (err) snprintf(err, err_len, "timed infer: %s", status_info(status));
-            goto cleanup;
-        }
-    }
-    uint64_t t1 = timer_ns();
-
-    if (out_passes) *out_passes = passes;
-    double elapsed_s = (double)(t1 - t0) / 1e9;
-    if (elapsed_s > 0)
-        result = (double)NPU_OPS_PER_INFERENCE * passes / elapsed_s / 1e12;
+ov_fail:
+    sb_report_info("%s: %s failed: %s", device, what, ov_err(st));
+    s = SB_ERR_IO;
 
 cleanup:
-    if (request)      ov_infer_request_free(request);
-    if (compiled)     ov_compiled_model_free(compiled);
-    if (input_tensor) ov_tensor_free(input_tensor);
-    if (input_port)   ov_output_const_port_free(input_port);
+    if (prec != NULL)     { ov_free(prec); }
+    if (req != NULL)      { ov_infer_request_free(req); }
+    if (compiled != NULL) { ov_compiled_model_free(compiled); }
+    if (tensor != NULL)   { ov_tensor_free(tensor); }
+    if (port != NULL)     { ov_output_const_port_free(port); }
     ov_shape_free(&shape);
-    return result;
+    return s;
 }
 
-static int print_available_devices(ov_core_t *core) {
-    ov_available_devices_t devices = {0};
-    int has_npu = 0;
-
-    ov_status_e status = ov_core_get_available_devices(core, &devices);
-    if (status != OK) {
-        printf("  Available OpenVINO devices: unavailable (%s)\n", status_info(status));
-        return 0;
-    }
-
-    printf("  Available OpenVINO devices:");
-    if (devices.size == 0) {
-        printf(" none");
-    }
-    for (size_t i = 0; i < devices.size; i++) {
-        const char *name = devices.devices[i];
-        printf(" %s", name);
-        if (name && strncmp(name, "NPU", 3) == 0)
-            has_npu = 1;
-    }
-    printf("\n");
-
-    ov_available_devices_free(&devices);
-    return has_npu;
-}
-
-void bench_npu(void) {
-    printf("=== NPU Compute Throughput (OpenVINO) ===\n");
-
-    /* Check model files exist */
-    FILE *f = fopen("models/npu_bench.xml", "r");
-    if (!f) {
-        printf("  Model not found, skipping\n");
-        printf("  (generate with: python3 tools/gen_openvino_model.py models/)\n");
+/* Prints the device list; sets listed[i] for each entry of targets[]. */
+static void report_devices(ov_core_t *core, bool *listed) {
+    ov_available_devices_t devs = { 0 };
+    ov_status_e            st   = ov_core_get_available_devices(core, &devs);
+    if (st != OK) {
+        sb_report_info("OpenVINO devices: unavailable (%s)", ov_err(st));
         return;
+    }
+    char   line[256] = "OpenVINO devices:";
+    size_t len       = strlen(line);
+    for (size_t i = 0; i < devs.size; i++) {
+        const char *name = devs.devices[i];
+        if (name == NULL) { continue; }
+        int w = snprintf(line + len, sizeof(line) - len, " %s", name);
+        if (w > 0 && (size_t)w < sizeof(line) - len) { len += (size_t)w; }
+        /* Multi-device systems list "GPU.0", "GPU.1": match the prefix. */
+        for (size_t t = 0; t < SB_ARRAY_LEN(targets); t++) {
+            size_t n = strlen(targets[t].device);
+            if (strncmp(name, targets[t].device, n) == 0) { listed[t] = true; }
+        }
+    }
+    if (devs.size == 0) { snprintf(line + len, sizeof(line) - len, " none"); }
+    sb_report_info("%s", line);
+    ov_available_devices_free(&devs);
+
+    for (size_t t = 0; t < SB_ARRAY_LEN(targets); t++) {
+        char *full = NULL;
+        if (!listed[t]) { continue; }
+        if (ov_core_get_property(core, targets[t].device, ov_property_key_device_full_name, &full) == OK &&
+            full != NULL) {
+            sb_report_info("  %s: %s", targets[t].device, full);
+            ov_free(full);
+        }
+    }
+}
+
+static sb_status_e npu_run(void) {
+    FILE *f = fopen(MODEL_XML, "r");
+    if (f == NULL) {
+        sb_report_info("Generate the model from the repo root: uv run tools/gen_openvino_model.py models/");
+        sb_report_skip("OpenVINO inference", "model not found (" MODEL_XML ")");
+        return SB_OK;
     }
     fclose(f);
 
-    ov_core_t *core = NULL;
-    ov_model_t *model = NULL;
-
-    if (ov_core_create(&core) != OK) {
-        printf("  Failed to create OpenVINO core\n");
-        return;
+    ov_core_t   *core  = NULL;
+    ov_model_t  *model = NULL;
+    f64         *lat   = NULL;
+    ov_version_t ver   = { 0 };
+    ov_status_e  st    = ov_core_create(&core);
+    if (st != OK) {
+        sb_report_info("ov_core_create: %s", ov_err(st));
+        sb_report_error("OpenVINO inference", SB_ERR_UNSUPPORTED);
+        return SB_OK;
+    }
+    st = ov_core_read_model(core, MODEL_XML, MODEL_BIN, &model);
+    if (st != OK) {
+        sb_report_info("ov_core_read_model: %s", ov_err(st));
+        sb_report_error("OpenVINO inference", SB_ERR_INVALID);
+        goto cleanup;
+    }
+    lat = SB_MALLOC(MAX_INFER * sizeof(f64));
+    if (lat == NULL) {
+        sb_report_error("OpenVINO inference", SB_ERR_NOMEM);
+        goto cleanup;
     }
 
-    if (ov_core_read_model(core, "models/npu_bench.xml", "models/npu_bench.bin",
-                           &model) != OK) {
-        printf("  Failed to load model\n");
-        ov_core_free(core);
-        return;
+    if (ov_get_openvino_version(&ver) == OK) {
+        sb_report_info("OpenVINO %s", ver.buildNumber != NULL ? ver.buildNumber : "?");
+        ov_version_free(&ver);
+    }
+    sb_report_info("Model: %dx MatMul %dx%d (f32), %.2f G model ops per inference",
+                   MM_LAYERS, MM_SIZE, MM_SIZE, (f64)MM_OPS / 1e9);
+    sb_report_info("TOPS are effective: model ops (multiply + add = 2) / time; precision is");
+    sb_report_info("plugin-selected. Times include the plugin's input/output transfer.");
+
+    bool listed[SB_ARRAY_LEN(targets)] = { false };
+    report_devices(core, listed);
+
+    for (size_t t = 0; t < SB_ARRAY_LEN(targets); t++) {
+        const char *dev = targets[t].device;
+        char        test[64];
+        sb_report_group(dev);
+        snprintf(test, sizeof(test), "%s effective", dev);
+        if (!listed[t] && !targets[t].always) {
+            sb_report_skip(test, "device not listed by OpenVINO");
+            continue;
+        }
+        infer_result r;
+        sb_status_e  s = run_device(core, model, dev, lat, &r);
+        if (s != SB_OK) {
+            sb_report_error(test, s);
+            continue;
+        }
+        sb_report_value(test, r.tops, "TOPS", SB_KIND_EFFECTIVE);
+        snprintf(test, sizeof(test), "%s latency (median)", dev);
+        sb_report_value(test, r.ms_median, "ms", SB_KIND_MEASURED);
+        snprintf(test, sizeof(test), "%s throughput", dev);
+        sb_report_value(test, r.inf_per_sec, "inf/s", SB_KIND_MEASURED);
     }
 
-    printf("  Model: %dx matmul %dx%d\n", NPU_NUM_LAYERS,
-           NPU_MATMUL_SIZE, NPU_MATMUL_SIZE);
-    printf("  TOPS counts model multiply/add operations; execution precision is framework-selected.\n");
-    int has_npu = print_available_devices(core);
-    printf("%-20s %14s\n", "Test", "Throughput");
-    printf("%-20s %14s\n", "----", "----------");
-
-    /* Try NPU device */
-    size_t npu_passes = 0;
-    char npu_error[256];
-    double npu_tops = has_npu ? run_inference_bench(core, model, "NPU", &npu_passes,
-                                                    npu_error, sizeof(npu_error)) : -1.0;
-    if (npu_tops > 0) {
-        printf("%-20s %10.2f TOPS\n", "NPU", npu_tops);
-    } else {
-        printf("%-20s %14s\n", "NPU", "not available");
-        if (!has_npu)
-            printf("  NPU detail: OpenVINO did not list an NPU device\n");
-        else if (npu_error[0] != '\0')
-            printf("  NPU detail: %s\n", npu_error);
-    }
-    fflush(stdout);
-
-    /* CPU baseline */
-    size_t cpu_passes = 0;
-    char cpu_error[256];
-    double cpu_tops = run_inference_bench(core, model, "CPU", &cpu_passes,
-                                          cpu_error, sizeof(cpu_error));
-    if (cpu_tops > 0)
-        printf("%-20s %10.2f TOPS\n", "CPU only", cpu_tops);
-    else
-        printf("%-20s %14s\n  CPU detail: %s\n", "CPU only", "error", cpu_error);
-    fflush(stdout);
-
-    if (npu_tops > 0 && cpu_tops > 0) {
-        double speedup = npu_tops / cpu_tops;
-        printf("%-20s %10.1fx\n", "NPU speedup", speedup);
-    }
-    if (npu_tops > 0 && npu_passes > 0) {
-        double ms_per = (double)NPU_OPS_PER_INFERENCE / (npu_tops * 1e12) * 1e3;
-        printf("%-20s %10.2f ms/inference\n", "NPU latency", ms_per);
-    }
-    fflush(stdout);
-
-    ov_model_free(model);
+cleanup:
+    SB_FREE(lat);
+    if (model != NULL) { ov_model_free(model); }
     ov_core_free(core);
+    return SB_OK;
 }
 
 #else
 
-void bench_npu(void) {
-    printf("=== NPU Compute Throughput ===\n");
-    printf("  Not available (requires OpenVINO runtime)\n");
+static sb_status_e npu_run(void) {
+    sb_report_skip("OpenVINO inference", "built without OpenVINO (see README)");
+    return SB_OK;
 }
 
 #endif
+
+const sb_section sb_section_npu = {
+    .name       = "npu",
+    .title      = "NPU Compute Throughput",
+    .help       = SB_NPU_HELP,
+    .run        = npu_run,
+    .repeatable = true,
+};
