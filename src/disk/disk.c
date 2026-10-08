@@ -1,502 +1,608 @@
-#include "bench.h"
-#include "sysinfo.h"
-#include "timer.h"
-#include "platform_io.h"
+/* SSD / storage: sequential and random direct I/O on one temporary file.
+ *
+ * The file is created with mkstemp under ./build/ and unlinked immediately, so
+ * an interrupted run cannot leak it; all tests use the one open descriptor
+ * (pread/pwrite are positional and thread-safe). Page caching is bypassed with
+ * F_NOCACHE + F_RDAHEAD=0 (macOS) or O_DIRECT (Linux).
+ *
+ * "N threads" rows are N threads each issuing one synchronous I/O at a time
+ * (QD1 per thread), not asynchronous queue depth.
+ *
+ * Durable sync is F_FULLFSYNC on macOS (plain fsync only reaches the drive's
+ * volatile cache there) and fdatasync on Linux (issues a device cache flush). */
+#include "disk/disk.h"
+#include "core/platform.h"
+#include "core/report.h"
+#include "core/thread.h"
+#include "core/timer.h"
 
-#include <stdio.h>
 #include <errno.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
-#include <pthread.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 
-#define TEST_DIR "./build"
-static char test_file[] = TEST_DIR "/bench-disktest-XXXXXX";
-#define FILE_SIZE (2ULL * 1024 * 1024 * 1024) /* 2 GiB working set */
-#define SEQ_BLOCK (1024 * 1024)           /* 1 MiB */
-#define RND_BLOCK 4096                    /* 4 KiB */
-#define TARGET_NS 2000000000ULL           /* 2 seconds */
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#include <sys/param.h>
+#else
+#include <limits.h>
+#endif
 
-static void fill_random(void *buf, size_t len) {
-    uint32_t *p = (uint32_t *)buf;
-    for (size_t i = 0; i < len / 4; i++)
-        p[i] = (uint32_t)rand();
+#define TEST_DIR      "./build"
+#define FILE_BYTES    (2ULL << 30)  /* default working set */
+#define FREE_MARGIN   (1ULL << 30)  /* keep this much space free on top of the file */
+#define SEQ_WRITE_MAX (1ULL << 30)  /* bytes written by the sequential write test */
+#define FILL_BLK      (8ULL << 20)
+#define SEQ_BLK       (1ULL << 20)
+#define BIG_BLK       (8ULL << 20)
+#define RND_BLK       4096ULL
+#define STAMP_STRIDE  4096ULL       /* every 4 KiB block gets a unique stamp */
+#define SMOKE_ENV     "SB_DISK_SMOKE_MIB"
+
+#if defined(__APPLE__)
+#define DURABLE_NAME "F_FULLFSYNC"
+#else
+#define DURABLE_NAME "fdatasync"
+#endif
+
+typedef struct {
+    u64  file_bytes;
+    u64  read_window_ns;
+    u64  write_window_ns;
+    u64  sync_window_ns;
+    u64  read_warmup_ns;
+    u64  write_warmup_ns;
+    bool smoke;
+} disk_cfg;
+
+/* --- Small helpers ------------------------------------------------------- */
+
+/* splitmix64: fast, good enough for offsets and incompressible fill data. */
+static inline u64 rng_next(u64 *s) {
+    u64 z = (*s += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
 }
 
-static int ensure_test_dir(void) {
-    if (mkdir(TEST_DIR, 0700) == 0 || errno == EEXIST)
-        return 0;
-    perror("mkdir");
-    return -1;
+/* Uniform in [0, n) without division (Lemire). */
+static inline u64 rng_below(u64 *s, u64 n) {
+    return (u64)(((unsigned __int128)rng_next(s) * n) >> 64);
 }
 
-static int full_pread(int fd, void *buf, size_t len, off_t off) {
-    char *p = (char *)buf;
-    size_t done = 0;
+static void rng_fill(u64 *s, u8 *buf, u64 len) {
+    for (u64 i = 0; i + 8 <= len; i += 8) {
+        u64 v = rng_next(s);
+        memcpy(buf + i, &v, 8);
+    }
+}
+
+static u64 io_align(void) {
+    u64 page = sb_platform_get()->page_size;
+    return page >= 4096 ? page : 4096;
+}
+
+static u8 *alloc_io_buf(u64 len) {
+    void *p = NULL;
+    if (posix_memalign(&p, (size_t)io_align(), (size_t)len) != 0) { return NULL; }
+    return p;
+}
+
+static sb_status_e io_full(int fd, u8 *buf, u64 len, u64 off, bool write) {
+    u64 done = 0;
     while (done < len) {
-        ssize_t n = pread(fd, p + done, len - done, off + (off_t)done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("pread");
-            return -1;
-        }
-        if (n == 0) {
-            fprintf(stderr, "pread: unexpected EOF\n");
-            return -1;
-        }
-        done += (size_t)n;
+        ssize_t n = write ? pwrite(fd, buf + done, (size_t)(len - done), (off_t)(off + done))
+                          : pread(fd, buf + done, (size_t)(len - done), (off_t)(off + done));
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n < 0 && errno == EINVAL) { return SB_ERR_UNSUPPORTED; }  /* O_DIRECT rejected */
+        if (n <= 0) { return SB_ERR_IO; }
+        done += (u64)n;
     }
-    return 0;
+    return SB_OK;
 }
 
-static int full_pwrite(int fd, const void *buf, size_t len, off_t off) {
-    const char *p = (const char *)buf;
-    size_t done = 0;
-    while (done < len) {
-        ssize_t n = pwrite(fd, p + done, len - done, off + (off_t)done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("pwrite");
-            return -1;
-        }
-        if (n == 0) {
-            fprintf(stderr, "pwrite: wrote 0 bytes\n");
-            return -1;
-        }
-        done += (size_t)n;
+/* Data reaches stable storage: F_FULLFSYNC on macOS, fdatasync on Linux. */
+static sb_status_e sync_durable(int fd) {
+    for (;;) {
+#if defined(__APPLE__)
+        int r = fcntl(fd, F_FULLFSYNC);
+#else
+        int r = fdatasync(fd);
+#endif
+        if (r == 0) { return SB_OK; }
+        if (errno == EINTR) { continue; }
+        return (errno == ENOTSUP || errno == EINVAL) ? SB_ERR_UNSUPPORTED : SB_ERR_IO;
     }
-    return 0;
 }
 
-static int checked_fsync(int fd) {
-    while (fsync(fd) < 0) {
-        if (errno == EINTR) continue;
-        perror("fsync");
-        return -1;
+#if defined(__APPLE__)
+/* Not durable: fsync hands data to the drive; F_BARRIERFSYNC also orders it. */
+static sb_status_e sync_fsync(int fd) {
+    while (fsync(fd) != 0) {
+        if (errno != EINTR) { return SB_ERR_IO; }
     }
-    return 0;
+    return SB_OK;
 }
 
-static int create_test_file(void *buf) {
-    int fd = mkstemp(test_file);
-    if (fd < 0) { perror("mkstemp"); return -1; }
-    if (disable_write_cache(fd) < 0) {
-        perror("F_NOCACHE");
-        close(fd);
-        unlink(test_file);
-        return -1;
+static sb_status_e sync_barrier(int fd) {
+    while (fcntl(fd, F_BARRIERFSYNC) != 0) {
+        if (errno == EINTR) { continue; }
+        return (errno == ENOTSUP || errno == EINVAL) ? SB_ERR_UNSUPPORTED : SB_ERR_IO;
     }
+    return SB_OK;
+}
+#endif
 
-    size_t written = 0;
-    while (written < FILE_SIZE) {
-        size_t chunk = SEQ_BLOCK;
-        if (chunk > FILE_SIZE - written) chunk = FILE_SIZE - written;
-        fill_random(buf, chunk);
-        if (full_pwrite(fd, buf, chunk, (off_t)written) < 0) {
-            close(fd);
-            unlink(test_file);
-            return -1;
-        }
-        written += chunk;
+/* Write the offset into the first bytes of every 4 KiB block, so no two
+ * blocks of the file or of successive writes carry identical data. */
+static void stamp(u8 *buf, u64 len, u64 off) {
+    for (u64 i = 0; i < len; i += STAMP_STRIDE) {
+        u64 v = off + i;
+        memcpy(buf + i, &v, 8);
     }
-    if (checked_fsync(fd) < 0) { close(fd); unlink(test_file); return -1; }
-    drop_page_cache(fd);
-    close(fd);
-    return 0;
 }
 
-static int open_nocache(int flags) {
-    int fd = open_direct(test_file, flags);
-    if (fd < 0) { perror("open"); return -1; }
-    return fd;
+/* --- Configuration and filesystem facts ---------------------------------- */
+
+static disk_cfg cfg_get(void) {
+    disk_cfg c = {
+        .file_bytes      = FILE_BYTES,
+        .read_window_ns  = 750'000'000ULL,
+        .write_window_ns = 1'000'000'000ULL,
+        .sync_window_ns  = 500'000'000ULL,
+        .read_warmup_ns  = SB_WARMUP_NS,
+        .write_warmup_ns = 50'000'000ULL,
+        .smoke           = false,
+    };
+    /* Smoke tests only: tiny file and windows. The numbers are meaningless. */
+    const char *env = getenv(SMOKE_ENV);
+    if (env != NULL && env[0] != '\0') {
+        u64 mib = strtoull(env, NULL, 10);
+        if (mib < 16) { mib = 16; }
+        if (mib > 2048) { mib = 2048; }
+        c.file_bytes      = (mib << 20) / BIG_BLK * BIG_BLK;
+        c.read_window_ns  = 100'000'000ULL;
+        c.write_window_ns = 100'000'000ULL;
+        c.sync_window_ns  = 100'000'000ULL;
+        c.read_warmup_ns  = 20'000'000ULL;
+        c.write_warmup_ns = 20'000'000ULL;
+        c.smoke           = true;
+    }
+    return c;
 }
 
-static double bench_seq_read(void *buf) {
-    int fd = open_nocache(O_RDONLY);
-    if (fd < 0) return -1;
-
-    /* Single pass after file creation; the drive's internal cache may be warm. */
-    uint64_t t0 = timer_ns();
-    for (size_t off = 0; off < FILE_SIZE; off += SEQ_BLOCK) {
-        if (full_pread(fd, buf, SEQ_BLOCK, (off_t)off) < 0) {
-            close(fd);
-            return -1;
+static void fs_type(const char *dir, char *out, size_t cap) {
+    out[0] = '\0';
+#if defined(__APPLE__)
+    struct statfs sfs;
+    if (statfs(dir, &sfs) == 0) { snprintf(out, cap, "%s", sfs.f_fstypename); }
+#else
+    /* Longest mount-point prefix of the resolved directory in /proc/mounts. */
+    char real[PATH_MAX];
+    if (realpath(dir, real) == NULL) { return; }
+    FILE *f = fopen("/proc/mounts", "r");
+    if (f == NULL) { return; }
+    char   line[1024];
+    size_t best = 0;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char dev[256], mnt[512], type[64];
+        if (sscanf(line, "%255s %511s %63s", dev, mnt, type) != 3) { continue; }
+        size_t ml = strlen(mnt);
+        bool   root  = strcmp(mnt, "/") == 0;
+        bool   match = root || (strncmp(real, mnt, ml) == 0 && (real[ml] == '\0' || real[ml] == '/'));
+        if (match && ml >= best) {
+            best = ml;
+            snprintf(out, cap, "%s", type);
         }
     }
-    uint64_t t1 = timer_ns();
-
-    close(fd);
-    if (t1 <= t0) return -1;
-    return (double)FILE_SIZE / ((double)(t1 - t0) / 1e9) / 1e9;
+    fclose(f);
+#endif
+    if (out[0] == '\0') { snprintf(out, cap, "unknown"); }
 }
 
-static double bench_seq_write(void *buf) {
-    int fd = open_nocache(O_RDWR);
-    if (fd < 0) return -1;
-
-    fill_random(buf, SEQ_BLOCK);
-
-    /* Calibrate passes */
-    uint64_t tc0 = timer_ns();
-    for (size_t off = 0; off < FILE_SIZE; off += SEQ_BLOCK) {
-        if (full_pwrite(fd, buf, SEQ_BLOCK, (off_t)off) < 0) {
-            close(fd);
-            return -1;
-        }
-    }
-    if (checked_fsync(fd) < 0) { close(fd); return -1; }
-    uint64_t tc1 = timer_ns();
-    uint64_t elapsed = tc1 - tc0;
-    size_t passes = elapsed > 0 ? (size_t)(TARGET_NS / elapsed) + 1 : 2;
-    if (passes < 2) passes = 2;
-
-    uint64_t t0 = timer_ns();
-    for (size_t p = 0; p < passes; p++) {
-        for (size_t off = 0; off < FILE_SIZE; off += SEQ_BLOCK) {
-            if (full_pwrite(fd, buf, SEQ_BLOCK, (off_t)off) < 0) {
-                close(fd);
-                return -1;
-            }
-        }
-        if (checked_fsync(fd) < 0) { close(fd); return -1; }
-    }
-    uint64_t t1 = timer_ns();
-
-    close(fd);
-    if (t1 <= t0) return -1;
-    return (double)FILE_SIZE * passes / ((double)(t1 - t0) / 1e9) / 1e9;
+static u64 fs_free_bytes(const char *dir) {
+    struct statvfs v;
+    if (statvfs(dir, &v) != 0) { return 0; }
+    return (u64)v.f_bavail * (u64)v.f_frsize;
 }
 
-static void bench_rand_read(void *buf, double *out_iops, double *out_lat_us) {
-    *out_iops = -1;
-    *out_lat_us = -1;
-    int fd = open_nocache(O_RDONLY);
-    if (fd < 0) return;
+/* --- Test file ----------------------------------------------------------- */
 
-    size_t max_off = FILE_SIZE / RND_BLOCK;
-
-    /* Warmup + calibrate */
-    size_t ops = 1000;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < ops; i++) {
-        off_t off = (off_t)((rand() % max_off) * RND_BLOCK);
-        if (full_pread(fd, buf, RND_BLOCK, off) < 0) {
-            close(fd);
-            return;
-        }
+/* Bypass the OS page cache on `fd`. */
+static sb_status_e set_direct(int fd) {
+#if defined(__APPLE__)
+    if (fcntl(fd, F_NOCACHE, 1) != 0) { return SB_ERR_SYS; }
+    (void)fcntl(fd, F_RDAHEAD, 0);
+    return SB_OK;
+#else
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0) { return SB_ERR_SYS; }
+    if (fcntl(fd, F_SETFL, fl | O_DIRECT) != 0) {
+        return errno == EINVAL ? SB_ERR_UNSUPPORTED : SB_ERR_SYS;
     }
-    uint64_t tc1 = timer_ns();
-    double ns_per_op = (double)(tc1 - tc0) / ops;
-    if (ns_per_op <= 0) { close(fd); return; }
-    ops = (size_t)(TARGET_NS / ns_per_op);
-    if (ops < 1000) ops = 1000;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < ops; i++) {
-        off_t off = (off_t)((rand() % max_off) * RND_BLOCK);
-        if (full_pread(fd, buf, RND_BLOCK, off) < 0) {
-            close(fd);
-            return;
-        }
-    }
-    uint64_t t1 = timer_ns();
-
-    close(fd);
-    if (t1 <= t0) return;
-    double elapsed_s = (double)(t1 - t0) / 1e9;
-    *out_iops = ops / elapsed_s;
-    *out_lat_us = (double)(t1 - t0) / ops / 1000.0;
+    return SB_OK;
+#endif
 }
 
-static void bench_rand_write(void *buf, double *out_iops, double *out_lat_us) {
-    *out_iops = -1;
-    *out_lat_us = -1;
-    int fd = open_nocache(O_RDWR);
-    if (fd < 0) return;
+/* Create, unlink and fill the file with incompressible data, then make it
+ * durable so the tests start with a clean drive write cache. Returns the fd. */
+static sb_status_e file_create(u64 bytes, u64 *rng, int *out_fd) {
+    char path[] = TEST_DIR "/sb-disk-XXXXXX";
+    int  fd     = mkstemp(path);
+    if (fd < 0) { return SB_ERR_IO; }
+    (void)unlink(path);  /* space is released when fd closes, even on a crash */
 
-    fill_random(buf, RND_BLOCK);
-    size_t max_off = FILE_SIZE / RND_BLOCK;
-
-    /* Warmup + calibrate */
-    size_t ops = 1000;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < ops; i++) {
-        off_t off = (off_t)((rand() % max_off) * RND_BLOCK);
-        if (full_pwrite(fd, buf, RND_BLOCK, off) < 0) {
-            close(fd);
-            return;
-        }
+    sb_status_e s   = set_direct(fd);
+    u8         *buf = NULL;
+    if (s != SB_OK) { goto fail; }
+    buf = alloc_io_buf(FILL_BLK);
+    if (buf == NULL) {
+        s = SB_ERR_NOMEM;
+        goto fail;
     }
-    if (checked_fsync(fd) < 0) { close(fd); return; }
-    uint64_t tc1 = timer_ns();
-    double ns_per_op = (double)(tc1 - tc0) / ops;
-    if (ns_per_op <= 0) { close(fd); return; }
-    ops = (size_t)(TARGET_NS / ns_per_op);
-    if (ops < 1000) ops = 1000;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < ops; i++) {
-        off_t off = (off_t)((rand() % max_off) * RND_BLOCK);
-        if (full_pwrite(fd, buf, RND_BLOCK, off) < 0) {
-            close(fd);
-            return;
-        }
+    rng_fill(rng, buf, FILL_BLK);
+    for (u64 off = 0; off < bytes; off += FILL_BLK) {
+        stamp(buf, FILL_BLK, off);
+        s = io_full(fd, buf, FILL_BLK, off, true);
+        if (s != SB_OK) { goto fail; }
     }
-    if (checked_fsync(fd) < 0) { close(fd); return; }
-    uint64_t t1 = timer_ns();
+    s = sync_durable(fd);
+    if (s != SB_OK) { goto fail; }
+#if !defined(__APPLE__)
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+    free(buf);
+    *out_fd = fd;
+    return SB_OK;
 
-    close(fd);
-    if (t1 <= t0) return;
-    double elapsed_s = (double)(t1 - t0) / 1e9;
-    *out_iops = ops / elapsed_s;
-    *out_lat_us = (double)(t1 - t0) / ops / 1000.0;
-}
-
-static void bench_rand_write_fsync(void *buf, double *out_iops, double *out_lat_us) {
-    *out_iops = -1;
-    *out_lat_us = -1;
-    int fd = open_nocache(O_RDWR);
-    if (fd < 0) return;
-
-    fill_random(buf, RND_BLOCK);
-    size_t max_off = FILE_SIZE / RND_BLOCK;
-
-    /* Calibrate — fsync per write is slow, start with fewer ops */
-    size_t ops = 100;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < ops; i++) {
-        off_t off = (off_t)((rand() % max_off) * RND_BLOCK);
-        if (full_pwrite(fd, buf, RND_BLOCK, off) < 0 ||
-            checked_fsync(fd) < 0) {
-            close(fd);
-            return;
-        }
-    }
-    uint64_t tc1 = timer_ns();
-    double ns_per_op = (double)(tc1 - tc0) / ops;
-    if (ns_per_op <= 0) { close(fd); return; }
-    ops = (size_t)(TARGET_NS / ns_per_op);
-    if (ops < 100) ops = 100;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < ops; i++) {
-        off_t off = (off_t)((rand() % max_off) * RND_BLOCK);
-        if (full_pwrite(fd, buf, RND_BLOCK, off) < 0 ||
-            checked_fsync(fd) < 0) {
-            close(fd);
-            return;
-        }
-    }
-    uint64_t t1 = timer_ns();
-
-    close(fd);
-    if (t1 <= t0) return;
-    double elapsed_s = (double)(t1 - t0) / 1e9;
-    *out_iops = ops / elapsed_s;
-    *out_lat_us = (double)(t1 - t0) / ops / 1000.0;
-}
-
-/* --- QD scaling (multi-threaded random 4K reads) --- */
-
-struct qd_arg {
-    size_t ops;
-    uint64_t elapsed_ns;
-    unsigned int seed;
-    int ok;
-};
-
-static void *qd_worker(void *arg) {
-    struct qd_arg *a = (struct qd_arg *)arg;
-    a->ok = 0;
-    int fd = open_nocache(O_RDONLY);
-    if (fd < 0) { a->elapsed_ns = 0; return NULL; }
-
-    void *buf;
-    if (posix_memalign(&buf, 4096, RND_BLOCK) != 0) {
-        a->elapsed_ns = 0;
-        close(fd);
-        return NULL;
-    }
-    size_t max_off = FILE_SIZE / RND_BLOCK;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < a->ops; i++) {
-        off_t off = (off_t)(((size_t)rand_r(&a->seed) % max_off) * RND_BLOCK);
-        if (full_pread(fd, buf, RND_BLOCK, off) < 0) {
-            free(buf);
-            close(fd);
-            return NULL;
-        }
-    }
-    uint64_t t1 = timer_ns();
-
-    a->elapsed_ns = t1 - t0;
-    a->ok = t1 > t0;
+fail:
     free(buf);
     close(fd);
-    return NULL;
+    return s;
 }
 
-static double bench_qd_scaling(void *buf, int nthreads) {
-    (void)buf;
-    size_t ops_per_thread = 5000;
+/* --- Multithreaded direct I/O on sb_par_run ------------------------------ */
 
-    struct qd_arg args[16];
-    pthread_t threads[16];
-    int nt = nthreads > 16 ? 16 : nthreads;
+typedef struct {
+    u64 rng;
+    u8 *buf;
+} io_thread;
 
-    for (int t = 0; t < nt; t++) {
-        args[t].ops = ops_per_thread;
-        args[t].seed = (unsigned int)(42 + t);
-        args[t].elapsed_ns = 0;
-        args[t].ok = 0;
+typedef struct {
+    int         fd;
+    u64         file_bytes;
+    u64         blk;
+    u64         nblk;
+    bool        write;
+    bool        random;
+    _Atomic u64 cursor;   /* sequential: next byte offset, shared by all threads */
+    atomic_int  status;   /* first failure, as sb_status_e */
+    u8         *threads;  /* io_thread per thread, cache-line strided */
+    size_t      stride;
+} io_ctx;
+
+typedef struct {
+    u32  nthreads;
+    u64  blk;
+    bool write;
+    bool random;
+    u64  chunk;      /* I/Os per sb_par_run callback */
+    u64  warmup_ns;
+    u64  window_ns;
+} io_spec;
+
+static io_thread *thread_at(io_ctx *c, u32 tid) {
+    return (io_thread *)(void *)(c->threads + (size_t)tid * c->stride);
+}
+
+/* Sequential: threads take the next block from a shared cursor, so together
+ * they form one sequential stream with up to N reads in flight. Random:
+ * uniform block-aligned offsets over the whole file. */
+static u64 io_work(void *p, u32 tid, u64 chunk) {
+    io_ctx *c = p;
+    if (atomic_load_explicit(&c->status, memory_order_relaxed) != SB_OK) { return 0; }
+    io_thread *t = thread_at(c, tid);
+    for (u64 i = 0; i < chunk; i++) {
+        u64 off;
+        if (c->random) {
+            off = rng_below(&t->rng, c->nblk) * c->blk;
+        } else {
+            off = atomic_fetch_add_explicit(&c->cursor, c->blk, memory_order_relaxed) % c->file_bytes;
+        }
+        if (c->write) { stamp(t->buf, c->blk, off); }
+        sb_status_e s = io_full(c->fd, t->buf, c->blk, off, c->write);
+        if (s != SB_OK) {
+            atomic_store(&c->status, (int)s);
+            return i;
+        }
     }
-    uint64_t t0 = timer_ns();
-    int created = 0;
-    for (int t = 0; t < nt; t++) {
-        if (pthread_create(&threads[t], NULL, qd_worker, &args[t]) != 0)
+    return chunk;
+}
+
+/* Runs `spec` for its window; returns I/Os per second summed over threads. */
+static sb_status_e par_io(int fd, u64 file_bytes, const io_spec *spec, u64 *rng, f64 *out_ops) {
+    u64 line = sb_platform_get()->cache_line;
+    if (line < sizeof(io_thread)) { line = 128; }
+    size_t stride = (sizeof(io_thread) + (size_t)line - 1) / (size_t)line * (size_t)line;
+
+    io_ctx c = {
+        .fd         = fd,
+        .file_bytes = file_bytes,
+        .blk        = spec->blk,
+        .nblk       = file_bytes / spec->blk,
+        .write      = spec->write,
+        .random     = spec->random,
+        .stride     = stride,
+    };
+    atomic_init(&c.cursor, rng_below(rng, c.nblk) * spec->blk);
+    atomic_init(&c.status, (int)SB_OK);
+
+    c.threads = calloc(spec->nthreads, stride);
+    if (c.threads == NULL) { return SB_ERR_NOMEM; }
+    sb_status_e s = SB_OK;
+    u32 nbuf = 0;
+    for (; nbuf < spec->nthreads; nbuf++) {
+        io_thread *t = thread_at(&c, nbuf);
+        t->rng = rng_next(rng);
+        t->buf = alloc_io_buf(spec->blk);
+        if (t->buf == NULL) {
+            s = SB_ERR_NOMEM;
             break;
-        created++;
-    }
-    if (created != nt) {
-        for (int t = 0; t < created; t++)
-            pthread_join(threads[t], NULL);
-        return -1;
+        }
+        rng_fill(&t->rng, t->buf, spec->blk);
     }
 
-    int all_ok = 1;
-    for (int t = 0; t < nt; t++) {
-        pthread_join(threads[t], NULL);
-        if (!args[t].ok)
-            all_ok = 0;
+    if (s == SB_OK) {
+        sb_par_cfg pc = {
+            .nthreads  = spec->nthreads,
+            .place     = SB_CORE_ANY,
+            .warmup_ns = spec->warmup_ns,
+            .window_ns = spec->window_ns,
+            .chunk     = spec->chunk,
+            .fn        = io_work,
+            .ctx       = &c,
+        };
+        sb_par_result r;
+        s = sb_par_run(&pc, &r);
+        if (s == SB_OK) { s = (sb_status_e)atomic_load(&c.status); }
+        if (s == SB_OK && r.units_per_sec <= 0) { s = SB_ERR_RANGE; }
+        if (s == SB_OK) { *out_ops = r.units_per_sec; }
     }
-    uint64_t elapsed = timer_ns() - t0;
 
-    if (!all_ok || elapsed == 0) return -1;
-    size_t total_ops = ops_per_thread * nt;
-    return (double)total_ops / ((double)elapsed / 1e9);
+    for (u32 i = 0; i < nbuf; i++) { free(thread_at(&c, i)->buf); }
+    free(c.threads);
+    return s;
 }
 
-/* --- Fsync latency --- */
+/* --- Single-threaded tests ----------------------------------------------- */
 
-static double bench_fsync_latency(void *buf) {
-    int fd = open_nocache(O_RDWR);
-    if (fd < 0) return -1;
+/* QD1 1 MiB writes from offset 0, then one durable sync; the sync is timed. */
+static sb_status_e seq_write_durable(int fd, u64 bytes, u64 *rng, f64 *out_gbs) {
+    u8 *buf = alloc_io_buf(SEQ_BLK);
+    if (buf == NULL) { return SB_ERR_NOMEM; }
+    rng_fill(rng, buf, SEQ_BLK);
 
-    /* Calibrate */
-    size_t iters = 100;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < iters; i++) {
-        if (full_pwrite(fd, buf, RND_BLOCK, 0) < 0 ||
-            checked_fsync(fd) < 0) {
-            close(fd);
-            return -1;
-        }
+    sb_status_e s  = SB_OK;
+    u64         t0 = sb_timer_now_ns();
+    for (u64 off = 0; off < bytes && s == SB_OK; off += SEQ_BLK) {
+        stamp(buf, SEQ_BLK, off ^ 0x5a5a000000000000ULL);
+        s = io_full(fd, buf, SEQ_BLK, off, true);
     }
-    uint64_t tc1 = timer_ns();
-    double ns_per = (double)(tc1 - tc0) / iters;
-    if (ns_per <= 0) { close(fd); return -1; }
-    iters = (size_t)(2000000000.0 / ns_per);
-    if (iters < 100) iters = 100;
-    if (iters > 50000) iters = 50000;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < iters; i++) {
-        if (full_pwrite(fd, buf, RND_BLOCK, 0) < 0 ||
-            checked_fsync(fd) < 0) {
-            close(fd);
-            return -1;
-        }
-    }
-    uint64_t t1 = timer_ns();
-
-    close(fd);
-    if (t1 <= t0) return -1;
-    return (double)(t1 - t0) / iters / 1000.0;
-}
-
-void bench_disk(void) {
-    if (ensure_test_dir() < 0) {
-        printf("=== SSD / Storage ===\n");
-        printf("  Failed to create build directory\n");
-        return;
-    }
-
-    struct disk_info di;
-    query_disk_info(&di, TEST_DIR);
-
-    printf("=== SSD / Storage ===\n");
-    if (di.fs_type[0])
-        printf("  Filesystem: %s\n", di.fs_type);
-    printf("%-22s %14s\n", "Test", "Throughput");
-    printf("%-22s %14s\n", "----", "----------");
-
-    void *buf;
-    if (posix_memalign(&buf, 4096, SEQ_BLOCK) != 0) {
-        printf("  Failed to allocate I/O buffer\n");
-        return;
-    }
-
-    if (create_test_file(buf) < 0) {
-        printf("  Failed to create test file\n");
-        free(buf);
-        return;
-    }
-
-    double sr = bench_seq_read(buf);
-    if (sr > 0) printf("%-22s %10.2f GB/s\n", "Seq read", sr);
-    fflush(stdout);
-
-    double sw = bench_seq_write(buf);
-    if (sw > 0) printf("%-22s %10.2f GB/s\n", "Seq write", sw);
-    fflush(stdout);
-
-    double rr_iops, rr_lat, rw_iops, rw_lat;
-    bench_rand_read(buf, &rr_iops, &rr_lat);
-    if (rr_iops > 0)
-        printf("%-22s %7.0fK IOPS  (%.1f \xC2\xB5s)\n",
-               "Rand 4K read", rr_iops / 1000.0, rr_lat);
-    fflush(stdout);
-
-    bench_rand_write(buf, &rw_iops, &rw_lat);
-    if (rw_iops > 0)
-        printf("%-22s %7.0fK IOPS  (%.1f \xC2\xB5s)\n",
-               "Rand 4K write (burst)", rw_iops / 1000.0, rw_lat);
-    fflush(stdout);
-
-    double rws_iops, rws_lat;
-    bench_rand_write_fsync(buf, &rws_iops, &rws_lat);
-    if (rws_iops > 0)
-        printf("%-22s %7.0fK IOPS  (%.1f \xC2\xB5s)\n",
-               "Rand 4K write (fsync)", rws_iops / 1000.0, rws_lat);
-    fflush(stdout);
-
-    /* --- Queue Depth Scaling --- */
-    printf("\n--- Queue Depth Scaling (random 4K read) ---\n");
-    printf("%-8s %12s\n", "QD", "IOPS");
-    printf("%-8s %12s\n", "--", "----");
-    {
-        int qds[] = {1, 2, 4, 8, 16};
-        for (int q = 0; q < 5; q++) {
-            double iops = bench_qd_scaling(buf, qds[q]);
-            if (iops > 0)
-                printf("%-8d %8.0fK\n", qds[q], iops / 1000.0);
-            fflush(stdout);
-        }
-    }
-
-    /* --- Fsync Latency --- */
-    {
-        double fsync_us = bench_fsync_latency(buf);
-        if (fsync_us > 0) {
-            printf("\n%-22s %10.1f \xC2\xB5s/fsync\n", "Fsync latency", fsync_us);
-            fflush(stdout);
-        }
-    }
-
+    if (s == SB_OK) { s = sync_durable(fd); }
+    u64 t1 = sb_timer_now_ns();
     free(buf);
-    unlink(test_file);
+    if (s != SB_OK) { return s; }
+    if (t1 <= t0) { return SB_ERR_RANGE; }
+    *out_gbs = (f64)bytes / (f64)(t1 - t0);
+    return SB_OK;
 }
+
+typedef sb_status_e (*sync_fn)(int fd);
+
+/* 4 KiB write at a random offset followed by `sync` each, for `window_ns`
+ * (at least 10 ops). Returns the mean time per write+sync. */
+static sb_status_e sync_latency(int fd, u64 file_bytes, sync_fn sync, u64 window_ns, u64 *rng, f64 *out_us) {
+    u8 *buf = alloc_io_buf(RND_BLK);
+    if (buf == NULL) { return SB_ERR_NOMEM; }
+    rng_fill(rng, buf, RND_BLK);
+
+    u64         nblk = file_bytes / RND_BLK;
+    u64         n    = 0;
+    sb_status_e s    = SB_OK;
+    u64         t0   = sb_timer_now_ns();
+    u64         t1   = t0;
+    while (s == SB_OK && (n < 10 || t1 - t0 < window_ns)) {
+        u64 off = rng_below(rng, nblk) * RND_BLK;
+        stamp(buf, RND_BLK, off ^ n);
+        s = io_full(fd, buf, RND_BLK, off, true);
+        if (s == SB_OK) { s = sync(fd); }
+        n++;
+        t1 = sb_timer_now_ns();
+    }
+    free(buf);
+    if (s != SB_OK) { return s; }
+    *out_us = (f64)(t1 - t0) / (f64)n / 1000.0;
+    return SB_OK;
+}
+
+/* --- Section ------------------------------------------------------------- */
+
+static void report(const char *test, sb_status_e s, f64 v, const char *unit) {
+    if (s == SB_OK)                  { sb_report_value(test, v, unit, SB_KIND_MEASURED); }
+    else if (s == SB_ERR_UNSUPPORTED) { sb_report_skip(test, "not supported by this filesystem"); }
+    else                             { sb_report_error(test, s); }
+}
+
+static void run_sequential(int fd, const disk_cfg *cfg, u64 *rng) {
+    sb_report_group("Sequential");
+    static const struct { const char *name; u32 nthreads; u64 blk; } reads[] = {
+        { "Seq read 1 MiB, 1 thread (QD1)",  1, SEQ_BLK },
+        { "Seq read 8 MiB, 1 thread (QD1)",  1, BIG_BLK },
+        { "Seq read 1 MiB, 4 threads x QD1", 4, SEQ_BLK },
+    };
+    for (size_t i = 0; i < SB_ARRAY_LEN(reads); i++) {
+        io_spec spec = {
+            .nthreads  = reads[i].nthreads,
+            .blk       = reads[i].blk,
+            .chunk     = 1,
+            .warmup_ns = cfg->read_warmup_ns,
+            .window_ns = cfg->read_window_ns,
+        };
+        f64 ops = 0;
+        sb_status_e s = par_io(fd, cfg->file_bytes, &spec, rng, &ops);
+        report(reads[i].name, s, ops * (f64)reads[i].blk / 1e9, "GB/s");
+    }
+}
+
+static void run_random_read(int fd, const disk_cfg *cfg, u64 *rng) {
+    sb_report_group("Random 4 KiB read (N threads, 1 I/O in flight each)");
+    static const struct { const char *name; u32 nthreads; } rows[] = {
+        { "Rand 4K read, 1 thread",   1 },
+        { "Rand 4K read, 2 threads",  2 },
+        { "Rand 4K read, 4 threads",  4 },
+        { "Rand 4K read, 8 threads",  8 },
+        { "Rand 4K read, 16 threads", 16 },
+        { "Rand 4K read, 32 threads", 32 },
+    };
+    for (size_t i = 0; i < SB_ARRAY_LEN(rows); i++) {
+        io_spec spec = {
+            .nthreads  = rows[i].nthreads,
+            .blk       = RND_BLK,
+            .random    = true,
+            .chunk     = 8,
+            .warmup_ns = cfg->read_warmup_ns,
+            .window_ns = cfg->read_window_ns,
+        };
+        f64 ops = 0;
+        sb_status_e s = par_io(fd, cfg->file_bytes, &spec, rng, &ops);
+        report(rows[i].name, s, ops, "IOPS");
+        if (rows[i].nthreads == 1) {
+            report("Rand 4K read QD1 mean latency", s, s == SB_OK ? 1e6 / ops : 0, "us");
+        }
+    }
+}
+
+static void run_writes(int fd, const disk_cfg *cfg, u64 *rng) {
+    sb_report_group("Write (durable: " DURABLE_NAME " included in the time)");
+    u64 bytes = cfg->file_bytes < SEQ_WRITE_MAX ? cfg->file_bytes : SEQ_WRITE_MAX;
+    f64 gbs   = 0;
+    sb_status_e s = seq_write_durable(fd, bytes, rng, &gbs);
+    report("Seq write 1 MiB QD1, durable", s, gbs, "GB/s");
+
+    /* Random writes for the window, then one durable sync. The sync also flushes
+     * the short warmup and the post-window tail, so the rate is slightly low. */
+    static const struct { const char *name; u32 nthreads; } rows[] = {
+        { "Rand 4K write, 1 thread, durable",   1 },
+        { "Rand 4K write, 4 threads, durable",  4 },
+        { "Rand 4K write, 16 threads, durable", 16 },
+    };
+    for (size_t i = 0; i < SB_ARRAY_LEN(rows); i++) {
+        io_spec spec = {
+            .nthreads  = rows[i].nthreads,
+            .blk       = RND_BLK,
+            .write     = true,
+            .random    = true,
+            .chunk     = 4,
+            .warmup_ns = cfg->write_warmup_ns,
+            .window_ns = cfg->write_window_ns,
+        };
+        f64 ops = 0;
+        s = par_io(fd, cfg->file_bytes, &spec, rng, &ops);
+        u64 t0 = sb_timer_now_ns();
+        if (s == SB_OK) { s = sync_durable(fd); }
+        f64 sync_s = (f64)(sb_timer_now_ns() - t0) / 1e9;
+        f64 win_s  = (f64)cfg->write_window_ns / 1e9;
+        report(rows[i].name, s, ops * win_s / (win_s + sync_s), "IOPS");
+    }
+}
+
+static void run_sync_latency(int fd, const disk_cfg *cfg, u64 *rng) {
+    sb_report_group("Sync latency (4 KiB write + sync, random offset)");
+    static const struct { const char *name; sync_fn fn; } rows[] = {
+#if defined(__APPLE__)
+        { "4K write+F_FULLFSYNC (durable)", sync_durable },
+        { "4K write+barrier (NOT durable)", sync_barrier },
+        { "4K write+fsync (NOT durable)",   sync_fsync },
+#else
+        { "4K write+fdatasync (durable)",   sync_durable },
+#endif
+    };
+    for (size_t i = 0; i < SB_ARRAY_LEN(rows); i++) {
+        f64 us = 0;
+        sb_status_e s = sync_latency(fd, cfg->file_bytes, rows[i].fn, cfg->sync_window_ns, rng, &us);
+        report(rows[i].name, s, us, "us");
+    }
+}
+
+static sb_status_e disk_run(void) {
+    disk_cfg cfg = cfg_get();
+    char     size[32];
+    char     type[64];
+
+    if (mkdir(TEST_DIR, 0700) != 0 && errno != EEXIST) {
+        sb_report_error("Create " TEST_DIR, SB_ERR_IO);
+        return SB_OK;
+    }
+    fs_type(TEST_DIR, type, sizeof(type));
+    sb_fmt_size(cfg.file_bytes, size, sizeof(size));
+#if defined(__APPLE__)
+    sb_report_info("File: %s, unlinked temp file in " TEST_DIR " (%s); F_NOCACHE, read-ahead off", size, type);
+    sb_report_info("Durable = F_FULLFSYNC (drive cache flushed). macOS fsync and F_BARRIERFSYNC");
+    sb_report_info("only hand data to the drive's volatile cache: NOT durable.");
+#else
+    sb_report_info("File: %s, unlinked temp file in " TEST_DIR " (%s); O_DIRECT", size, type);
+    sb_report_info("Durable = fdatasync on an O_DIRECT fd (device write cache flushed).");
+    if (strcmp(type, "tmpfs") == 0 || strcmp(type, "ramfs") == 0) {
+        sb_report_info("WARNING: %s is RAM-backed; these are memory speeds, not storage.", type);
+    }
+#endif
+    sb_report_info("\"N threads\" = N threads, each with one synchronous I/O in flight (not async QD).");
+    if (cfg.smoke) { sb_report_info("SMOKE MODE (" SMOKE_ENV "): tiny file and windows, numbers are meaningless."); }
+
+    u64 need = cfg.file_bytes + FREE_MARGIN;
+    if (fs_free_bytes(TEST_DIR) < need) {
+        sb_report_skip("Storage tests", "not enough free space in " TEST_DIR);
+        return SB_OK;
+    }
+
+    u64 rng = sb_timer_now_ns() ^ ((u64)getpid() << 32);
+    int fd  = -1;
+    sb_status_e s = file_create(cfg.file_bytes, &rng, &fd);
+    if (s == SB_ERR_UNSUPPORTED) {
+        sb_report_skip("Storage tests", "direct I/O unsupported on this fs");
+        return SB_OK;
+    }
+    if (s != SB_OK) {
+        sb_report_error("Create test file", s);
+        return SB_OK;
+    }
+
+    /* Order: reads first (on the freshly created file), then writes. */
+    run_sequential(fd, &cfg, &rng);
+    run_random_read(fd, &cfg, &rng);
+    run_writes(fd, &cfg, &rng);
+    run_sync_latency(fd, &cfg, &rng);
+    close(fd);
+    return SB_OK;
+}
+
+const sb_section sb_section_disk = {
+    .name       = "disk",
+    .title      = "SSD / Storage",
+    .help       =
+        "  One 2 GiB file under ./build/, created fresh each pass and unlinked at once\n"
+        "  (no leak if interrupted). F_NOCACHE (macOS) / O_DIRECT (Linux) bypasses the\n"
+        "  page cache; drive caches still participate. Reads: sequential 1 MiB and\n"
+        "  8 MiB with 1 thread, 1 MiB with 4 threads; random 4 KiB with 1-32 threads.\n"
+        "  \"N threads\" means N synchronous I/Os in flight, not async queue depth.\n"
+        "  Writes are durable (F_FULLFSYNC / fdatasync, timed): 1 GiB sequential,\n"
+        "  random 4 KiB with 1/4/16 threads. Sync latency: write + sync per 4 KiB;\n"
+        "  macOS fsync and F_BARRIERFSYNC rows are labelled NOT durable.\n"
+        "  About 3.2 GiB is written per pass; needs 3 GiB free.\n",
+    .run        = disk_run,
+    .repeatable = true,
+};
