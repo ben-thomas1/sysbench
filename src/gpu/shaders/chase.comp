@@ -1,0 +1,12 @@
+#version 450
+// Single-thread pointer chase; the position is carried across dispatches in r[0].
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer Data { uint d[]; };
+layout(set = 0, binding = 1) buffer Pos { uint r[]; };
+layout(push_constant) uniform Params { uint n; uint a; uint b; uint c; } p;
+
+void main() {
+    uint x = r[0];
+    for (uint i = 0u; i < p.n; i++) { x = d[x]; }
+    r[0] = x;
+}

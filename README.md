@@ -43,8 +43,10 @@ make release
 
 `shaderc` supplies `glslc`, which compiles the Vulkan shaders during the build.
 For other GPUs, install the corresponding Vulkan driver instead of `vulkan-intel`.
-A Vulkan 1.1 device is required for GPU tests; FP16 also requires shader arithmetic
-and 16-bit storage-buffer support.
+A Vulkan 1.1 device is required for GPU tests; FP16 also requires `shaderFloat16`
+(VK_KHR_shader_float16_int8). The section prefers a discrete GPU over an integrated
+one and prints the device it chose; set `SB_GPU_DEVICE=<index|name substring>` to
+pick another (the index is the position in the printed device list).
 
 OpenBLAS is optional:
 
@@ -228,10 +230,32 @@ parameters so the operation count matches the workload.
   average time each thread waits per increment (threads / aggregate).
 - Allocation rows are libc malloc+free pairs (the same-size fast path) and a
   held batch of mixed sizes freed in random order, in ns per pair.
-- GPU times include host submission and completion overhead. “VRAM” identifies
-  private/device-local buffers; integrated GPUs can share physical RAM with
-  host-visible buffers. Shared-memory and texture rates describe these kernels,
-  including their arithmetic and cache behavior.
+- GPU rows are timed with GPU timestamps (Metal `GPUStartTime`/`GPUEndTime`,
+  Vulkan timestamp queries) over command buffers of ~100 ms containing several
+  dispatches; the fastest of three is shown. Submission overhead is excluded.
+  The same kernels run on Metal and Vulkan and produce the same rows.
+- GPU compute `[peak]` rows use 32 independent FMA chains per thread on
+  float2/half2, which saturates the ALUs (M4 Pro: ~8.0 TFLOPS of 8.08
+  theoretical at 1578 MHz). Apple GPUs run FP16 at the FP32 rate; GPUs with
+  packed FP16 report about twice the FP32 rate. INT32 is a 32-bit multiply-add
+  with runtime operands; integer multiply is quarter rate on Apple GPUs.
+- GPU memory bandwidth is a coalesced grid-stride read of a 1 GiB buffer. The
+  host-visible row appears only on discrete GPUs, where it measures system
+  memory across the bus; on unified memory (Apple, integrated GPUs) it is
+  skipped because it is the same DRAM as device-local memory.
+- GPU latency is one thread chasing a random cycle of nodes 128 B apart. Small
+  sizes show the GPU caches; the largest sizes include TLB misses.
+- Threadgroup (shared) memory is the best case: lane-contiguous float4 reads
+  whose 32-lane footprint is aligned to 512 B, with no bank conflicts. Real
+  kernels often get much less. On the M4 Pro, the same read shifted off that
+  alignment by one element drops about 3×, and a 32-bit lane stride of 2/4/32
+  words drops 2×/3.5×/20×.
+- Texture “cache-resident” is the bilinear filtering rate with one RGBA8 texel
+  per thread over a 16 KiB texture (texture unit throughput). “Streaming”
+  samples a 256 MiB texture once, so it measures the texture path from DRAM in
+  GB/s and is comparable with the buffer bandwidth row. The texture holds random
+  (incompressible) data: GPUs that compress textures losslessly read compressible
+  content faster than DRAM bandwidth (M4 Pro: ~450 GB/s for an all-zero texture).
 - Storage bypasses the OS page cache with `F_NOCACHE` or `O_DIRECT`.
   Drive/controller caches may still participate. “N threads” rows are N threads
   that each keep one synchronous I/O in flight, not asynchronous queue depth;

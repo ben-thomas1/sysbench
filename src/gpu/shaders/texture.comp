@@ -1,0 +1,23 @@
+#version 450
+// Bilinear RGBA8 sampling at texel boundaries (2x2 footprint, equal weights), 1 texel per thread in x,
+// walking 2 * n rows in y. Normalized coordinates with repeat addressing, LOD 0.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 0, binding = 1) writeonly buffer Out { float result[]; };
+layout(push_constant) uniform Params { uint n; uint a; uint b; uint c; } p;
+
+void main() {
+    uint  tid = gl_GlobalInvocationID.x;
+    uint  w   = p.a;
+    float inv = 1.0 / float(w);
+    float u   = float(tid % w + 1u) * inv;
+    float v   = float(((tid / w) * 2u * p.n) % w + 1u) * inv;
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0);
+    for (uint i = 0u; i < p.n; i++) {
+        a0 += textureLod(tex, vec2(u, v), 0.0);
+        a1 += textureLod(tex, vec2(u, v + inv), 0.0);
+        v  += 2.0 * inv;
+    }
+    vec4 a = a0 + a1;
+    result[tid] = a.x + a.y + a.z + a.w;
+}

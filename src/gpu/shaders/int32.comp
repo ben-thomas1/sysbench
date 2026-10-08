@@ -1,0 +1,21 @@
+#version 450
+// INT32 multiply-add: 16 chains, body 2x; b and c are runtime values (no constant folding).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Buf { uint data[]; };
+layout(push_constant) uniform Params { uint n; uint a; uint b; uint c; } p;
+
+#define R4(M, x) M(x##0) M(x##1) M(x##2) M(x##3)
+#define R16(M) R4(M, a0) R4(M, a1) R4(M, a2) R4(M, a3)
+#define IDECL(v) uint v = s; s += 1u;
+#define IMAD(v)  v = v * b + c;
+#define IXOR(v)  r ^= v;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint s = data[tid], b = p.b, c = p.c;
+    R16(IDECL)
+    for (uint i = 0u; i < p.n; i++) { R16(IMAD) R16(IMAD) }
+    uint r = 0u;
+    R16(IXOR)
+    data[tid] = r;
+}
