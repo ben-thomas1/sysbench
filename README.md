@@ -85,7 +85,7 @@ leave its temporary file in `build/`; `make clean` removes build artifacts.
 
 | Section | Selection | Measurement |
 |---------|-----------|-------------|
-| CPU | `cpu` | Scalar and SIMD multiply/add throughput; single-thread and multicore runs |
+| CPU | `cpu` | Peak scalar and SIMD multiply-add throughput per type; 1 thread, all cores, P/E cores; ops per cycle |
 | Branch prediction | `branch` | Forced branches over predictable and random outcome streams |
 | GPU | `gpu` | FP32/FP16/INT32, buffer and shared-memory bandwidth, dependent-load latency, texture sampling |
 | Memory | `mem` | Latency and read bandwidth from 4 KiB to 1 GiB; stores, atomics, allocation |
@@ -160,17 +160,30 @@ count matches the workload.
 
 ## Interpreting results
 
-- Arithmetic rates count source-level operations: multiply + add is two
-  operations. Instructions, SIMD widths, compiler transformations, and inference
-  precision differ between backends. These are workload measurements, not
-  verified hardware peak rates.
-- CPU multicore rows divide total work by wall time, including thread startup
-  and completion. Workers get equal iteration counts, so slower cores affect
-  completion time. Linux workers use the process's allowed CPU set, up to 64;
-  macOS placement is controlled by the scheduler. Single-thread runs are not pinned.
-- IPC is an estimate normalized to a reported maximum clock, or an ADD-loop
-  clock calibration that assumes one cycle per dependent ADD. It is not a
-  hardware instruction/cycle counter measurement.
+- Arithmetic rates count a multiply-add as two operations (an int8 dot product
+  counts two per 8-bit multiply-accumulate). Instructions, SIMD widths and
+  inference precision differ between backends. Rows tagged `[peak]` come from
+  kernels built to saturate one unit; `[estimate]` rows depend on a stated
+  assumption; `[effective]` rows count nominal work.
+- CPU `[peak]` rows are inline-asm loops with enough independent accumulator
+  chains to hide the multiply-add latency (20 on AArch64, 12 or 16 on x86), so the
+  instruction mix does not depend on compiler flags. The row label names the
+  instruction. Scalar integer is a single 64-bit row: narrower C integer types
+  use the same scalar multiplier. The x86 SIMD tier (SSE2, AVX2, AVX-512) is
+  fixed at build time by `-march`; SSE2 and integer lanes have no fused
+  multiply-add, so those rows time a multiply and an add per step.
+- CPU multicore rows are time-based: every thread runs the kernel for the same
+  window after a warmup, and the total is the sum of per-thread rates. On hybrid
+  CPUs the P-cores and E-cores are also measured separately. macOS has no
+  pinning, so P = USER_INTERACTIVE and E = BACKGROUND QoS. macOS runs BACKGROUND
+  threads at a reduced E-cluster clock and shares those cores with system daemons,
+  so the macOS E rows understate the E-core peak. The all-core rows include the
+  E-cores at full clock. Linux pins P/E threads by affinity; all-core threads are
+  unpinned.
+- "Ops per cycle" divides by a clock measured with a dependent integer add chain,
+  which assumes one cycle per add (an estimate). On Linux, when perf_event is
+  permitted, user-mode cycle and instruction counters replace that clock, and
+  real IPC is reported as measured. macOS counters need root.
 - Branch penalties are estimates from extra elapsed time. Linux uses hardware
   counters when available for the whole measurement; otherwise the table
   shows assumed miss rates. Counts include loop and unconditional branches.
