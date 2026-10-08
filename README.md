@@ -88,7 +88,7 @@ measures the filesystem containing the repository.
 | CPU | `cpu` | Peak scalar and SIMD multiply-add throughput per type; 1 thread, all cores, P/E cores; ops per cycle |
 | Branch prediction | `branch` | One asm branch over predictable and random outcome streams; mispredict penalty by direction |
 | GPU | `gpu` | FP32/FP16/INT32, buffer and shared-memory bandwidth, dependent-load latency, texture sampling |
-| Memory | `mem` | Latency and read bandwidth from 4 KiB to 1 GiB; stores, atomics, allocation |
+| Memory | `mem` | Latency 4 KiB to 1 GiB, TLB walk cost, read bandwidth (1 thread and multithreaded DRAM), memcpy, stores, atomics, allocation |
 | Storage | `disk` | Sequential and random 4 KiB direct I/O, 1–32 threads, durable vs non-durable sync latency |
 | System | `sys` | getuid and open+close cost, pipe handoff (blocking and busy-poll), shared cache-line handoff, thread create/join |
 | Network | `net` | TCP loopback and Unix socketpair throughput and one-byte round-trip latency (blocking and busy-poll) |
@@ -207,9 +207,27 @@ parameters so the operation count matches the workload.
   otherwise from a dependent add-chain clock estimate. Periodic patterns may
   or may not be learned depending on the core and even the code layout; read
   their miss counts rather than assuming either.
-- Memory bandwidth is measured by one thread. The pointer chase uses a fixed
-  64-byte stride; cache-line sizes and cache topology differ across machines.
-  macOS cache metadata describes the performance cluster; Linux describes CPU 0.
+- Memory latency is a pointer chase through one random cycle with a stride of
+  the detected cache line (128 B on Apple Silicon, 64 B on x86). Large sizes
+  also miss the TLB; the TLB rows touch one line per page with data that stays
+  in cache, and "Page walk" (an estimate) is how much of each large-size
+  latency is address translation. Linux runs use base pages (THP disabled for
+  the test buffer). macOS cache metadata describes the performance cluster;
+  Linux describes CPU 0.
+- Read bandwidth rows are kernels built to saturate the load path (`[peak]`):
+  one thread over a size sweep, then DRAM with several threads, each streaming
+  its own slice for a fixed time window. memcpy rows count bytes read plus bytes
+  written (twice the bytes copied); write-allocate traffic is not counted.
+- Store rows are the better of two loop shapes per size. Some cores (Apple
+  M-series) only skip reading a line before overwriting it for certain loop
+  shapes, so the slower shape is shown at DRAM size too. "Non-temporal" is a
+  hint on AArch64 (`stnp`) and a cache-bypassing store on x86 (`movnt*`).
+- Atomic latency rows are dependent chains on one cache line; throughput rows
+  are independent adds spread over 8 lines. Contended rows put every thread on
+  one line: "aggregate" is total increments per second, "per thread" is the
+  average time each thread waits per increment (threads / aggregate).
+- Allocation rows are libc malloc+free pairs (the same-size fast path) and a
+  held batch of mixed sizes freed in random order, in ns per pair.
 - GPU times include host submission and completion overhead. “VRAM” identifies
   private/device-local buffers; integrated GPUs can share physical RAM with
   host-visible buffers. Shared-memory and texture rates describe these kernels,
