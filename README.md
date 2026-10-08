@@ -78,10 +78,10 @@ The full suite normally takes about one to two minutes on recent laptops.
 Run on AC power with other demanding applications idle when comparing results.
 Record the commit, compiler, OS, power mode, and library/driver versions.
 
-The disk section creates a uniquely named 2 GiB file under `build/`, writes
-several GiB during measurement, and removes the file on normal completion.
-It measures the filesystem containing the repository. An interrupted run can
-leave its temporary file in `build/`; `make clean` removes build artifacts.
+The disk section creates a uniquely named 2 GiB file under `build/` and
+unlinks it immediately, so even an interrupted run leaves nothing behind. It
+writes about 3.2 GiB per pass, needs 3 GiB free, and takes about 15 s. It
+measures the filesystem containing the repository.
 
 | Section | Selection | Measurement |
 |---------|-----------|-------------|
@@ -89,7 +89,7 @@ leave its temporary file in `build/`; `make clean` removes build artifacts.
 | Branch prediction | `branch` | Forced branches over predictable and random outcome streams |
 | GPU | `gpu` | FP32/FP16/INT32, buffer and shared-memory bandwidth, dependent-load latency, texture sampling |
 | Memory | `mem` | Latency and read bandwidth from 4 KiB to 1 GiB; stores, atomics, allocation |
-| Storage | `disk` | Sequential I/O, random 4 KiB I/O, concurrent readers, write + fsync latency |
+| Storage | `disk` | Sequential and random 4 KiB direct I/O, 1–32 threads, durable vs non-durable sync latency |
 | System | `sys` | getuid, pipe process handoff, thread create/join |
 | Network | `net` | TCP loopback throughput and one-byte round-trip latency |
 | Matrix | `matrix` | FP32 SGEMM via Accelerate or OpenBLAS |
@@ -182,9 +182,14 @@ count matches the workload.
   host-visible buffers. Shared-memory and texture rates describe these kernels,
   including their arithmetic and cache behavior.
 - Storage bypasses the OS page cache with `F_NOCACHE` or `O_DIRECT`.
-  Drive/controller caches may still participate. “Burst” writes have one final
-  fsync; the other random-write row syncs every write. macOS `fsync` does not
-  provide the stronger drive-flush guarantee of `F_FULLFSYNC`.
+  Drive/controller caches may still participate. “N threads” rows are N threads
+  that each keep one synchronous I/O in flight, not asynchronous queue depth;
+  a single QD1 stream underestimates sequential read (use the 4-thread row).
+  Rows marked “durable” include a drive cache flush in the timing:
+  `F_FULLFSYNC` on macOS, `fdatasync` on Linux. On macOS, `fsync` and
+  `F_BARRIERFSYNC` only reach the drive's volatile cache; those rows are marked
+  NOT durable (about 30× and 3× faster than a real flush on an M4 Pro). Random-write rates
+  depend on the drive's internal state and vary by ±30% between runs.
 - Pipe handoff includes pipe syscalls and scheduling. TCP loopback measures
   the local OS stack, not the network interface.
 

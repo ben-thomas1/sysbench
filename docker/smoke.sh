@@ -14,6 +14,8 @@ step "release build, -march=native (AVX2 under emulation)"
 meson setup /tmp/b-native --buildtype=release -Db_lto=true -Db_pie=true >/dev/null
 meson compile -C /tmp/b-native >/dev/null || fail=1
 /tmp/b-native/bench --only cpu,branch,gpu,sys,matrix,npu || fail=1
+# Smoke-only small disk run (64 MiB file, 0.1 s windows).
+SB_DISK_SMOKE_MIB=64 /tmp/b-native/bench --only disk || fail=1
 
 step "release build, -march=x86-64 (SSE2 tier)"
 meson setup /tmp/b-sse2 --buildtype=release -Dmarch=x86-64 >/dev/null
