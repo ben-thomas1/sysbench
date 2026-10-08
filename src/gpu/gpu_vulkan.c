@@ -517,7 +517,8 @@ static sb_status_e buf_device(sb_gpu_dev *d, u64 size, const void *data, u32 pat
     return s;
 }
 
-/* RGBA8 texture of incompressible bytes, device-local, uploaded through a staging buffer. */
+/* RGBA8 texture of incompressible bytes (drivers may compress images losslessly),
+ * device-local, uploaded through a staging buffer. */
 static sb_status_e make_texture(sb_gpu_dev *d, u32 dim) {
     sb_status_e s     = SB_OK;
     u64         bytes = (u64)dim * dim * 4;

@@ -53,13 +53,8 @@ static NSString *const kernel_src = @
     "kernel void bw(device const float4 *src [[buffer(0)]], device float *dst [[buffer(1)]],\n"
     "               constant prm &p [[buffer(2)]], uint tid [[thread_position_in_grid]],\n"
     "               uint nt [[threads_per_grid]]) {\n"
-    "    float4 s0 = 0, s1 = 0, s2 = 0, s3 = 0;\n"
-    "    uint i = tid;\n"
-    "    for (; i + 3u * nt < p.n; i += 4u * nt) {\n"
-    "        s0 += src[i]; s1 += src[i + nt]; s2 += src[i + 2u * nt]; s3 += src[i + 3u * nt];\n"
-    "    }\n"
-    "    for (; i < p.n; i += nt) { s0 += src[i]; }\n"
-    "    float4 s = (s0 + s1) + (s2 + s3);\n"
+    "    float4 s = 0;\n"
+    "    for (uint i = tid; i < p.n; i += nt) { s += src[i]; }\n"
     "    dst[tid] = s.x + s.y + s.z + s.w;\n"
     "}\n"
     "\n"
@@ -226,7 +221,10 @@ static id<MTLBuffer> private_buf(sb_gpu_dev *d, u64 bytes) {
     return wait_cb(cb) == SB_OK ? b : nil;
 }
 
-/* Private RGBA8 texture of incompressible bytes, uploaded through a blit. */
+/* Private RGBA8 texture of incompressible bytes, uploaded through a blit.
+ * Apple GPUs losslessly compress private textures: on the M4 Pro a linear
+ * byte pattern streams at ~260 GB/s and zeros at ~450 GB/s, above DRAM
+ * bandwidth, so random content is required to measure the DRAM path. */
 static id<MTLTexture> make_texture(sb_gpu_dev *d, u32 dim) {
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                     width:dim

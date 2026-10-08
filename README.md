@@ -202,7 +202,9 @@ count matches the workload.
 - Texture “cache-resident” is the bilinear filtering rate with one RGBA8 texel
   per thread over a 16 KiB texture (texture unit throughput). “Streaming”
   samples a 256 MiB texture once, so it measures the texture path from DRAM in
-  GB/s and is comparable with the buffer bandwidth row.
+  GB/s and is comparable with the buffer bandwidth row. The texture holds random
+  (incompressible) data: GPUs that compress textures losslessly read compressible
+  content faster than DRAM bandwidth (M4 Pro: ~450 GB/s for an all-zero texture).
 - Storage bypasses the OS page cache with `F_NOCACHE` or `O_DIRECT`.
   Drive/controller caches may still participate. “Burst” writes have one final
   fsync; the other random-write row syncs every write. macOS `fsync` does not

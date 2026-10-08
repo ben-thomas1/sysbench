@@ -1,5 +1,6 @@
 #version 450
-// Coalesced grid-stride read: consecutive threads read consecutive vec4s.
+// Coalesced grid-stride read: consecutive threads read consecutive vec4s, one load per iteration
+// (on the M4 Pro, 4 loads per iteration spaced a grid apart were ~5% slower: more concurrent DRAM streams).
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Src { vec4 src[]; };
 layout(set = 0, binding = 1) writeonly buffer Dst { float dst[]; };
@@ -8,12 +9,7 @@ layout(push_constant) uniform Params { uint n; uint a; uint b; uint c; } p;
 void main() {
     uint tid = gl_GlobalInvocationID.x;
     uint nt  = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
-    vec4 s0 = vec4(0.0), s1 = vec4(0.0), s2 = vec4(0.0), s3 = vec4(0.0);
-    uint i = tid;
-    for (; i + 3u * nt < p.n; i += 4u * nt) {
-        s0 += src[i]; s1 += src[i + nt]; s2 += src[i + 2u * nt]; s3 += src[i + 3u * nt];
-    }
-    for (; i < p.n; i += nt) { s0 += src[i]; }
-    vec4 s = (s0 + s1) + (s2 + s3);
+    vec4 s = vec4(0.0);
+    for (uint i = tid; i < p.n; i += nt) { s += src[i]; }
     dst[tid] = s.x + s.y + s.z + s.w;
 }
