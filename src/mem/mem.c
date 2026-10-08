@@ -1,281 +1,135 @@
-#include "bench.h"
-#include "sysinfo.h"
-#include "timer.h"
-#include "util.h"
+#include "mem/mem.h"
+#include "mem/mem_internal.h"
+#include "core/platform.h"
+#include "core/report.h"
+#include "core/timer.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdatomic.h>
-#include <pthread.h>
-#include <unistd.h>
+#include <sys/mman.h>
 
-/* Platform bandwidth functions — implemented in mem_arm.c / mem_x86.c */
-extern double measure_bandwidth_gbps(size_t size_bytes);
-extern double measure_store_bandwidth_cached_gbps(size_t size_bytes);
-extern double measure_store_bandwidth_streaming_gbps(size_t size_bytes);
+#define ARENA_MAX     (1ULL << 30)
+#define CALIB_NS      2'000'000ULL
+#define TARGET_NS     25'000'000ULL
+#define TIMED_REPS    3
 
-static double measure_latency_ns_stride(size_t size_bytes, size_t stride) {
-    size_t count = size_bytes / stride;
-    if (count < 2) count = 2;
+/* --- Shared helpers --- */
 
-    void *raw;
-    if (posix_memalign(&raw, 4096, count * stride) != 0)
-        return -1;
-    memset(raw, 0, count * stride);
-    void **buf = (void **)raw;
-
-    size_t *indices = malloc(count * sizeof(size_t));
-    if (!indices) {
-        free(raw);
-        return -1;
-    }
-    for (size_t i = 0; i < count; i++) indices[i] = i;
-    shuffle_indices(indices, count);
-
-    for (size_t i = 0; i < count - 1; i++) {
-        void **src = (void **)((char *)buf + indices[i] * stride);
-        void **dst = (void **)((char *)buf + indices[i + 1] * stride);
-        *src = (void *)dst;
-    }
-    void **last = (void **)((char *)buf + indices[count - 1] * stride);
-    void **first = (void **)((char *)buf + indices[0] * stride);
-    *last = (void *)first;
-    free(indices);
-
-    void **p = first;
-    /* Warmup: run for at least 50ms to ensure CPU frequency ramp-up
-       (Intel pstate needs sustained load to reach turbo) */
-    {
-        uint64_t tw0 = timer_ns();
-        while (timer_ns() - tw0 < 50000000ULL) {
-            for (size_t i = 0; i < 1000; i++) {
-                p = (void **)*p;
-                __asm__ volatile("" : "+r"(p));
-            }
-        }
-    }
-
-    /* Calibrate: run a short burst, then scale to ~200ms target */
-    size_t iters = 1000;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < iters; i++) {
-        p = (void **)*p;
-        __asm__ volatile("" : "+r"(p));
-    }
-    uint64_t tc1 = timer_ns();
-    double ns_per_iter = (double)(tc1 - tc0) / iters;
-    if (ns_per_iter <= 0) {
-        free(raw);
-        return -1;
-    }
-    iters = (size_t)(200000000.0 / ns_per_iter);
-    if (iters < 1000) iters = 1000;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < iters; i++) {
-        p = (void **)*p;
-        __asm__ volatile("" : "+r"(p));
-    }
-    uint64_t t1 = timer_ns();
-
-    free(raw);
-    if (t1 <= t0) return -1;
-    return (double)(t1 - t0) / iters;
+u64 mem_rng_next(u64 *state) {
+    u64 x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
 }
 
-static double measure_latency_ns(size_t size_bytes) {
-    return measure_latency_ns_stride(size_bytes, 64);
+u32 mem_rng_below(u64 *state, u32 bound) {
+    u64 r = mem_rng_next(state) >> 32;
+    return (u32)((r * bound) >> 32);
 }
 
-/* --- Atomics --- */
+sb_status_e mem_time_best(mem_rep_fn fn, void *ctx, f64 *out_ns_per_rep) {
+    u64 reps = 1;
+    u64 dt   = 0;
+    for (;;) {
+        u64 t0 = sb_timer_now_ns();
+        fn(ctx, reps);
+        dt = sb_timer_now_ns() - t0;
+        if (dt >= CALIB_NS) { break; }
+        if (reps > (UINT64_MAX >> 2)) { return SB_ERR_RANGE; }
+        reps *= 2;
+    }
+    f64 scaled = (f64)reps * (f64)TARGET_NS / (f64)dt;
+    reps = scaled < 1.0 ? 1 : (u64)scaled;
 
-static double measure_atomic_uncontended(void) {
-    _Atomic uint64_t __attribute__((aligned(64))) counter = 0;
-
-    size_t iters = 10000;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < iters; i++)
-        atomic_fetch_add(&counter, 1);
-    uint64_t tc1 = timer_ns();
-    double ns_per = (double)(tc1 - tc0) / iters;
-    if (ns_per <= 0) return -1;
-    iters = (size_t)(200000000.0 / ns_per);
-    if (iters < 10000) iters = 10000;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < iters; i++)
-        atomic_fetch_add(&counter, 1);
-    uint64_t t1 = timer_ns();
-    if (t1 <= t0) return -1;
-    return (double)(t1 - t0) / iters;
+    u64 best = UINT64_MAX;
+    for (u32 r = 0; r < TIMED_REPS; r++) {
+        u64 t0 = sb_timer_now_ns();
+        fn(ctx, reps);
+        dt = sb_timer_now_ns() - t0;
+        if (dt < best) { best = dt; }
+    }
+    if (best == 0) { return SB_ERR_RANGE; }
+    *out_ns_per_rep = (f64)best / (f64)reps;
+    return SB_OK;
 }
 
-struct atomic_arg {
-    _Atomic uint64_t *counter;
-    size_t iters;
+/* --- Arena: one prefaulted mapping reused by every test --- */
+
+static sb_status_e arena_init(mem_arena *a) {
+    const sb_platform *p = sb_platform_get();
+    u64 want = ARENA_MAX;
+    /* Stay under a quarter of RAM on small machines. */
+    while (p->mem_bytes > 0 && want > p->mem_bytes / 4 && want > (64ULL << 20)) { want >>= 1; }
+
+    void *m = mmap(NULL, (size_t)want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) { return SB_ERR_NOMEM; }
+#if defined(__linux__) && defined(MADV_NOHUGEPAGE)
+    /* Base pages on every system, whatever the THP setting, so the TLB rows mean the same thing. */
+    (void)madvise(m, (size_t)want, MADV_NOHUGEPAGE);
+#endif
+    memset(m, 0x11, (size_t)want);  /* fault every page in before any timing */
+    a->base  = m;
+    a->bytes = (size_t)want;
+    return SB_OK;
+}
+
+static void arena_free(mem_arena *a) {
+    if (a->base != NULL) { munmap(a->base, a->bytes); }
+    a->base  = NULL;
+    a->bytes = 0;
+}
+
+static void report_platform(void) {
+    const sb_platform *p = sb_platform_get();
+    char l1[24], l2[24], l3[24], ram[24], pg[24];
+    snprintf(ram, sizeof(ram), "%.1f GiB", (f64)p->mem_bytes / (f64)(1ULL << 30));
+    sb_fmt_size(p->l1d_bytes, l1, sizeof(l1));
+    sb_fmt_size(p->l2_bytes, l2, sizeof(l2));
+    sb_fmt_size(p->l3_bytes, l3, sizeof(l3));
+    sb_fmt_size(p->page_size, pg, sizeof(pg));
+    sb_report_info("Cache line %u B, page %s, L1d %s, L2 %s%s%s, RAM %s; kernels: %s",
+                   p->cache_line, pg, p->l1d_bytes ? l1 : "?", p->l2_bytes ? l2 : "?",
+                   p->l3_bytes ? ", L3 " : "", p->l3_bytes ? l3 : "", p->mem_bytes ? ram : "?",
+                   mem_kern_isa);
+}
+
+static sb_status_e mem_run(void) {
+    report_platform();
+
+    mem_arena   a = {0};
+    sb_status_e s = arena_init(&a);
+    if (s != SB_OK) {
+        sb_report_error("Memory arena", s);
+        return s;
+    }
+    char sz[24];
+    sb_report_info("Single-thread tests: best of 3 x ~25 ms after warm-up, in a %s prefaulted buffer.",
+                   sb_fmt_size(a.bytes, sz, sizeof(sz)));
+    sb_timer_spin(SB_WARMUP_NS);
+
+    s = mem_run_latency(&a);
+    if (s == SB_OK) { s = mem_run_bandwidth(&a); }
+    arena_free(&a);
+    if (s == SB_OK) { s = mem_run_atomics(); }
+    if (s == SB_OK) { s = mem_run_alloc(); }
+    return s;
+}
+
+const sb_section sb_section_mem = {
+    .name       = "mem",
+    .title      = "Memory Latency & Bandwidth",
+    .help       =
+        "  Latency: pointer chase through one random cycle, stride = cache line,\n"
+        "  4 KiB to 1 GiB; TLB rows touch one line per page to show page-walk cost.\n"
+        "  Read bandwidth: one thread over a size sweep, then DRAM with 2, 4, all\n"
+        "  P-cores, all cores and E-cores (time-based); memcpy counts read + write bytes.\n"
+        "  Store bandwidth: best of two loop shapes per size, plus the slower shape\n"
+        "  and non-temporal stores at DRAM size. Atomics: uncontended fetch_add\n"
+        "  latency, independent-add throughput and CAS latency; contended fetch_add\n"
+        "  on one line as aggregate Mops/s and per-thread ns/op. malloc+free pairs at\n"
+        "  64 B, 4 KiB and 1 MiB, and a held batch of mixed sizes freed in random order.\n",
+    .run        = mem_run,
+    .repeatable = true,
 };
-
-static void *atomic_contended_worker(void *arg) {
-    struct atomic_arg *a = (struct atomic_arg *)arg;
-    for (size_t i = 0; i < a->iters; i++)
-        atomic_fetch_add(a->counter, 1);
-    return NULL;
-}
-
-static double measure_atomic_contended(int nthreads) {
-    _Atomic uint64_t __attribute__((aligned(64))) counter = 0;
-    size_t per_thread = 1000000;
-
-    struct atomic_arg args[64];
-    pthread_t threads[64];
-    int nt = nthreads > 64 ? 64 : nthreads;
-
-    uint64_t t0 = timer_ns();
-    for (int t = 0; t < nt; t++) {
-        args[t].counter = &counter;
-        args[t].iters = per_thread;
-        if (pthread_create(&threads[t], NULL, atomic_contended_worker, &args[t]) != 0) {
-            for (int j = 0; j < t; j++)
-                pthread_join(threads[j], NULL);
-            return -1;
-        }
-    }
-    for (int t = 0; t < nt; t++)
-        pthread_join(threads[t], NULL);
-    uint64_t t1 = timer_ns();
-
-    if (t1 <= t0) return -1;
-    return (double)(t1 - t0) / (per_thread * nt);
-}
-
-/* --- Malloc throughput --- */
-
-static double measure_malloc_throughput(size_t alloc_size) {
-    size_t iters = 100000;
-    uint64_t tc0 = timer_ns();
-    for (size_t i = 0; i < iters; i++) {
-        void *p = malloc(alloc_size);
-        if (!p) return -1;
-        __asm__ volatile("" : "+r"(p));
-        free(p);
-    }
-    uint64_t tc1 = timer_ns();
-    double ns_per = (double)(tc1 - tc0) / iters;
-    if (ns_per <= 0) return -1;
-    iters = (size_t)(2000000000.0 / ns_per);
-    if (iters < 100000) iters = 100000;
-
-    uint64_t t0 = timer_ns();
-    for (size_t i = 0; i < iters; i++) {
-        void *p = malloc(alloc_size);
-        if (!p) return -1;
-        __asm__ volatile("" : "+r"(p));
-        free(p);
-    }
-    uint64_t t1 = timer_ns();
-    if (t1 <= t0) return -1;
-    return (double)iters / ((double)(t1 - t0) / 1e9) / 1e6;
-}
-
-/* --- Entry point --- */
-
-void bench_memory(void) {
-    size_t sizes[] = {
-        4*1024, 8*1024, 16*1024, 32*1024, 64*1024,
-        128*1024, 256*1024, 512*1024,
-        1*1024*1024, 2*1024*1024, 4*1024*1024,
-        8*1024*1024, 16*1024*1024, 32*1024*1024,
-        64*1024*1024, 128*1024*1024, 256*1024*1024, 512*1024*1024,
-        1024UL*1024*1024
-    };
-    size_t nsizes = sizeof(sizes) / sizeof(sizes[0]);
-
-    struct mem_info mi;
-    query_mem_info(&mi);
-    struct cpu_info ci;
-    query_cpu_info(&ci);
-
-    printf("=== Memory Latency & Bandwidth ===\n");
-    if (mi.total_bytes > 0)
-        printf("  Total: %zu GiB\n", (size_t)(mi.total_bytes / (1024UL * 1024 * 1024)));
-    printf("  Page size: %zu bytes\n", mi.page_size);
-
-    char cache[128] = "";
-    int pos = 0;
-    if (ci.l1d_bytes > 0)
-        pos += snprintf(cache + pos, sizeof(cache) - pos,
-                        "L1d: %s", fmt_size(ci.l1d_bytes));
-    if (ci.l2_bytes > 0)
-        pos += snprintf(cache + pos, sizeof(cache) - pos,
-                        "  L2: %s", fmt_size(ci.l2_bytes));
-    if (ci.l3_bytes > 0)
-        pos += snprintf(cache + pos, sizeof(cache) - pos,
-                        "  L3: %s", fmt_size(ci.l3_bytes));
-    if (pos > 0)
-        printf("  Cache: %s\n", cache);
-    printf("%-12s %12s %12s\n", "Size", "Latency", "Bandwidth");
-    printf("%-12s %12s %12s\n", "----", "-------", "---------");
-    for (size_t i = 0; i < nsizes; i++) {
-        double lat = measure_latency_ns(sizes[i]);
-        double bw = measure_bandwidth_gbps(sizes[i]);
-        if (lat > 0 && bw > 0)
-            printf("%-12s %9.2f ns %8.2f GB/s\n", fmt_size(sizes[i]), lat, bw);
-        else
-            printf("%-12s %12s %12s\n", fmt_size(sizes[i]), "error", "error");
-        fflush(stdout);
-    }
-
-    /* --- Store Bandwidth --- */
-    printf("\n--- Store Bandwidth ---\n");
-    printf("%-12s %12s %12s\n", "Size", "Cached", "Streaming");
-    printf("%-12s %12s %12s\n", "----", "------", "---------");
-    size_t store_sizes[] = {
-        32*1024, 256*1024, 4*1024*1024, 64*1024*1024, 512*1024*1024
-    };
-    for (size_t i = 0; i < sizeof(store_sizes)/sizeof(store_sizes[0]); i++) {
-        double cached = measure_store_bandwidth_cached_gbps(store_sizes[i]);
-        double streaming = measure_store_bandwidth_streaming_gbps(store_sizes[i]);
-        char cached_s[24], streaming_s[24];
-        if (cached > 0) snprintf(cached_s, sizeof(cached_s), "%8.2f GB/s", cached);
-        else            snprintf(cached_s, sizeof(cached_s), "%12s", "error");
-        if (streaming > 0) snprintf(streaming_s, sizeof(streaming_s), "%8.2f GB/s", streaming);
-        else               snprintf(streaming_s, sizeof(streaming_s), "%12s", "n/a");
-        printf("%-12s %12s %12s\n", fmt_size(store_sizes[i]), cached_s, streaming_s);
-        fflush(stdout);
-    }
-
-    /* --- Atomics Contention --- */
-    printf("\n--- Atomics ---\n");
-    double uncontended = measure_atomic_uncontended();
-    if (uncontended > 0)
-        printf("%-24s %8.2f ns/op\n", "Uncontended", uncontended);
-    else
-        printf("%-24s %12s\n", "Uncontended", "error");
-    fflush(stdout);
-
-    int contention_levels[] = {2, 4, 8};
-    for (int c = 0; c < 3; c++) {
-        double ct = measure_atomic_contended(contention_levels[c]);
-        char label[32];
-        snprintf(label, sizeof(label), "Contended (%d threads)", contention_levels[c]);
-        if (ct > 0)
-            printf("%-24s %8.2f ns/op\n", label, ct);
-        else
-            printf("%-24s %12s\n", label, "error");
-        fflush(stdout);
-    }
-
-    /* --- Allocation Throughput --- */
-    printf("\n--- Allocation ---\n");
-    size_t alloc_sizes[] = {64, 256, 4096};
-    for (size_t i = 0; i < 3; i++) {
-        double mops = measure_malloc_throughput(alloc_sizes[i]);
-        if (mops > 0)
-            printf("malloc/free %-5zuB %10.2f Mops/s\n", alloc_sizes[i], mops);
-        else
-            printf("malloc/free %-5zuB %10s\n", alloc_sizes[i], "error");
-        fflush(stdout);
-    }
-}
