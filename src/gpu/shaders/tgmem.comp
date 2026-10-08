@@ -1,0 +1,23 @@
+#version 450
+// Shared memory read: 16 lane-contiguous vec4 loads per iteration, SIMD footprint aligned to 32 elements.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Buf { vec4 data[]; };
+layout(push_constant) uniform Params { uint n; uint a; uint b; uint c; } p;
+
+shared vec4 sm[1024 + 16 * 32];
+
+#define TGL(j) s += sm[b + uint(j) * 32u];
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    for (uint i = lid; i < 1024u + 16u * 32u; i += 256u) { sm[i] = data[(tid & ~255u) + (i & 255u)]; }
+    barrier();
+    vec4 s = vec4(0.0);
+    for (uint i = 0u; i < p.n; i++) {
+        uint b = (lid + i * 32u) & 1023u;
+        TGL(0) TGL(1) TGL(2) TGL(3) TGL(4) TGL(5) TGL(6) TGL(7)
+        TGL(8) TGL(9) TGL(10) TGL(11) TGL(12) TGL(13) TGL(14) TGL(15)
+    }
+    data[tid] = s;
+}
