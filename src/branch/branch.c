@@ -1,438 +1,346 @@
-#include "bench.h"
-#include "timer.h"
+#include "branch/branch.h"
+#include "branch/kernel.h"
+#include "branch/pmu.h"
+#include "core/report.h"
+#include "core/thread.h"
+#include "core/timer.h"
 
-#include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-#ifdef __linux__
-#include <linux/perf_event.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
+#define PAT_LEN      (1u << 20)        /* outcomes per stream: far beyond predictor history */
+#define ROUNDS       21                /* interleaved trials per pattern; best one counts */
+#define TRIAL_NS     15'000'000ULL
+#define CHAIN_NS     10'000'000ULL
+#define CALIB_ITERS  1'000'000ULL
 
-#define BRANCH_PATTERN_LEN (1U << 20)
-#define BRANCH_TARGET_NS  200000000ULL
-#define BRANCH_TRIALS     5
+static_assert((PAT_LEN & (PAT_LEN - 1)) == 0, "PAT_LEN must be a power of two");
 
-static_assert((BRANCH_PATTERN_LEN & (BRANCH_PATTERN_LEN - 1)) == 0,
-               "BRANCH_PATTERN_LEN must be a power of two");
+/* Outcome streams; value 1 = the measured branch is taken. */
+typedef enum {
+    PAT_TAKEN,
+    PAT_NOT_TAKEN,
+    PAT_ALT,
+    PAT_PERIOD8,
+    PAT_PERIOD64,
+    PAT_RAND1,
+    PAT_RAND10,
+    PAT_RAND90,
+    PAT_RAND50,
+    PAT_COUNT,
+} pat_e;
 
-enum branch_pattern {
-    PATTERN_ALWAYS_TAKEN,
-    PATTERN_ALTERNATING,
-    PATTERN_PERIODIC_8,
-    PATTERN_PERIODIC_64,
-    PATTERN_RANDOM_50,
-    PATTERN_RANDOM_90,
-    PATTERN_RANDOM_99,
-};
-
-struct branch_case {
+typedef struct {
     const char *name;
-    enum branch_pattern pattern;
-    double expected_miss_rate;
+    bool        random;    /* minority outcomes are unpredictable */
+} pat_info;
+
+static const pat_info pats[PAT_COUNT] = {
+    [PAT_TAKEN]     = { "Always taken",              false },
+    [PAT_NOT_TAKEN] = { "Never taken",               false },
+    [PAT_ALT]       = { "Alternating",               false },
+    [PAT_PERIOD8]   = { "Period 8 (1 taken in 8)",   false },
+    [PAT_PERIOD64]  = { "Period 64 (1 taken in 64)", false },
+    [PAT_RAND1]     = { "Random, 1% taken",          true  },
+    [PAT_RAND10]    = { "Random, 10% taken",         true  },
+    [PAT_RAND90]    = { "Random, 90% taken",         true  },
+    [PAT_RAND50]    = { "Random, 50% taken",         true  },
 };
 
-struct branch_result {
-    double branch_ns;
-    double extra_ns;
-    double penalty_ns;
-    uint64_t hw_branches;
-    uint64_t hw_misses;
-    size_t logical_branches;
-    int have_counters;
+/* Penalty = extra time / extra misses of one random pattern. The direction
+ * matters on Apple M4: missing a branch that is usually taken costs much
+ * more than missing one that is usually not taken. 10% rather than 1%
+ * minority outcomes: 1% leaves ~0.04 ns of signal per iteration and varied
+ * by +-20% between runs; 10% still has misses far enough apart that each
+ * one pays the full refill. */
+typedef struct {
+    const char *name;
+    pat_e       pat;
+} penalty_info;
+
+static const penalty_info penalties[] = {
+    { "Taken, predicted not-taken", PAT_RAND10 },
+    { "Not-taken, predicted taken", PAT_RAND90 },
+    { "Mixed (50% taken)",          PAT_RAND50 },
 };
 
-#ifdef __linux__
-struct branch_perf {
-    int branches_fd;
-    int misses_fd;
-    int ok;
-};
+typedef struct {
+    u8                  *pat[PAT_COUNT];
+    f64                  assumed[PAT_COUNT];   /* random: assumed misses/iteration */
+    u64                  iters[PAT_COUNT];
+    f64                  ns[PAT_COUNT];        /* best ns/iteration */
+    bool                 have_counts[PAT_COUNT];
+    sb_branch_pmu_counts counts[PAT_COUNT];    /* from the best trial with valid counts */
+    f64                  count_ns[PAT_COUNT];
+    f64                  add_ns;               /* best ns per dependent add */
+    bool                 pmu_ok;
+    const char          *pmu_name;
+    char                 pmu_reason[96];
+    sb_status_e          status;
+} bench_ctx;
 
-struct branch_perf_read {
-    uint64_t nr;
-    uint64_t time_enabled;
-    uint64_t time_running;
-    uint64_t values[2];
-};
-
-static int perf_event_open_hw(uint64_t config, int group_fd, int disabled) {
-    struct perf_event_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.type = PERF_TYPE_HARDWARE;
-    attr.size = sizeof(attr);
-    attr.config = config;
-    attr.disabled = disabled;
-    attr.exclude_kernel = 1;
-    attr.exclude_hv = 1;
-    attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED |
-                       PERF_FORMAT_TOTAL_TIME_RUNNING;
-
-    return (int)syscall(__NR_perf_event_open, &attr, 0, -1, group_fd, 0);
+static u64 splitmix64(u64 *s) {
+    u64 z = (*s += 0x9E37'79B9'7F4A'7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58'476D'1CE4'E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D0'49BB'1331'11EBULL;
+    return z ^ (z >> 31);
 }
 
-static void branch_perf_close(struct branch_perf *p) {
-    if (p->branches_fd >= 0) close(p->branches_fd);
-    if (p->misses_fd >= 0) close(p->misses_fd);
-    p->branches_fd = -1;
-    p->misses_fd = -1;
-    p->ok = 0;
-}
-
-static struct branch_perf branch_perf_open(void) {
-    struct branch_perf p = {-1, -1, 0};
-
-    p.branches_fd = perf_event_open_hw(PERF_COUNT_HW_BRANCH_INSTRUCTIONS, -1, 1);
-    if (p.branches_fd < 0)
-        return p;
-
-    p.misses_fd = perf_event_open_hw(PERF_COUNT_HW_BRANCH_MISSES, p.branches_fd, 0);
-    if (p.misses_fd < 0) {
-        branch_perf_close(&p);
-        return p;
-    }
-
-    p.ok = 1;
-    return p;
-}
-
-static int branch_perf_start(struct branch_perf *p) {
-    if (!p || !p->ok)
-        return 0;
-    if (ioctl(p->branches_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) < 0)
-        return 0;
-    if (ioctl(p->branches_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) < 0)
-        return 0;
-    return 1;
-}
-
-static int branch_perf_stop(struct branch_perf *p,
-                            uint64_t *branches, uint64_t *misses) {
-    struct branch_perf_read data;
-
-    if (!p || !p->ok)
-        return 0;
-
-    if (ioctl(p->branches_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP) < 0)
-        return 0;
-
-    memset(&data, 0, sizeof(data));
-    if (read(p->branches_fd, &data, sizeof(data)) != (ssize_t)sizeof(data))
-        return 0;
-    /* Reject partial counts after multiplexing or migration between PMUs. */
-    if (data.nr != 2 || data.time_running == 0 || data.time_running != data.time_enabled)
-        return 0;
-
-    *branches = data.values[0];
-    *misses = data.values[1];
-    return 1;
-}
-#else
-struct branch_perf {
-    int ok;
-};
-
-static void branch_perf_close(struct branch_perf *p) {
-    (void)p;
-}
-
-static struct branch_perf branch_perf_open(void) {
-    struct branch_perf p = {0};
-    return p;
-}
-
-static int branch_perf_start(struct branch_perf *p) {
-    (void)p;
-    return 0;
-}
-
-static int branch_perf_stop(struct branch_perf *p,
-                            uint64_t *branches, uint64_t *misses) {
-    (void)p;
-    (void)branches;
-    (void)misses;
-    return 0;
-}
-#endif
-
-#if defined(__aarch64__)
-static inline void forced_branch(uint8_t value, uint64_t *acc) {
-    uint64_t a = *acc;
-    uint32_t v = value;
-    __asm__ volatile(
-        "tbz %w[v], #0, 1f\n\t"
-        "add %[a], %[a], #3\n\t"
-        "b 2f\n\t"
-        "1: add %[a], %[a], #7\n\t"
-        "b 2f\n\t"
-        "2:"
-        : [a] "+r"(a)
-        : [v] "r"(v)
-        : "cc");
-    *acc = a;
-}
-#elif defined(__x86_64__)
-static inline void forced_branch(uint8_t value, uint64_t *acc) {
-    uint64_t a = *acc;
-    __asm__ volatile(
-        "testb $1, %[v]\n\t"
-        "jz 1f\n\t"
-        "addq $3, %[a]\n\t"
-        "jmp 2f\n\t"
-        "1: addq $7, %[a]\n\t"
-        "jmp 2f\n\t"
-        "2:"
-        : [a] "+r"(a)
-        : [v] "q"(value)
-        : "cc");
-    *acc = a;
-}
-#else
-static inline void forced_branch(uint8_t value, uint64_t *acc) {
-    if (value)
-        *acc += 3;
-    else
-        *acc += 7;
-}
-#endif
-
-static uint32_t xorshift32(uint32_t *state) {
-    uint32_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    return x;
-}
-
-static void fill_pattern(uint8_t *out, size_t n, enum branch_pattern pattern) {
-    uint32_t rng = 0x12345678u;
-
-    for (size_t i = 0; i < n; i++) {
-        switch (pattern) {
-        case PATTERN_ALWAYS_TAKEN:
-            out[i] = 1;
-            break;
-        case PATTERN_ALTERNATING:
-            out[i] = (uint8_t)(i & 1);
-            break;
-        case PATTERN_PERIODIC_8:
-            out[i] = (uint8_t)((i & 7) == 0);
-            break;
-        case PATTERN_PERIODIC_64:
-            out[i] = (uint8_t)((i & 63) == 0);
-            break;
-        case PATTERN_RANDOM_50:
-            out[i] = (uint8_t)(xorshift32(&rng) >> 31);
-            break;
-        case PATTERN_RANDOM_90:
-            out[i] = (uint8_t)((xorshift32(&rng) % 10) != 0);
-            break;
-        case PATTERN_RANDOM_99:
-            out[i] = (uint8_t)((xorshift32(&rng) % 100) != 0);
-            break;
+/* splitmix64 rather than xorshift: the predictor partly learns xorshift's
+ * linear bit structure (FINDINGS: 47.7% instead of 50% misses). */
+static f64 fill(u8 *pat, pat_e p) {
+    u64 rng  = 0x5EED'0000'0000'0000ULL + (u64)p;
+    u64 ones = 0;
+    for (u32 i = 0; i < PAT_LEN; i++) {
+        bool v = false;
+        switch (p) {
+        case PAT_TAKEN:     v = true;                                      break;
+        case PAT_NOT_TAKEN: v = false;                                     break;
+        case PAT_ALT:       v = (i & 1) != 0;                              break;
+        case PAT_PERIOD8:   v = i % 8 == 0;                                break;
+        case PAT_PERIOD64:  v = i % 64 == 0;                               break;
+        case PAT_RAND1:     v = splitmix64(&rng) < UINT64_MAX / 100;       break;
+        case PAT_RAND10:    v = splitmix64(&rng) < UINT64_MAX / 10;        break;
+        case PAT_RAND90:    v = splitmix64(&rng) >= UINT64_MAX / 10;       break;
+        case PAT_RAND50:    v = (splitmix64(&rng) >> 63) != 0;             break;
+        case PAT_COUNT:                                                    break;
         }
+        pat[i] = v ? 1 : 0;
+        ones  += v ? 1 : 0;
     }
+    if (p == PAT_RAND50) { return 0.5; }  /* no predictor beats a coin flip */
+    u64 minority = ones < PAT_LEN - ones ? ones : PAT_LEN - ones;
+    return (f64)minority / (f64)PAT_LEN;
 }
 
-static uint64_t run_branchy(const uint8_t *pattern, size_t len,
-                            size_t iters, uint64_t seed) {
-    uint64_t acc = seed;
-    size_t idx = 0;
+static f64 time_pattern(const bench_ctx *c, pat_e p, u64 iters, sb_branch_pmu *pmu,
+                        sb_branch_pmu_counts *out, bool *out_ok) {
+    *out_ok = false;
+    bool counting = pmu != NULL && sb_branch_pmu_start(pmu) == SB_OK;
+    u64 t0  = sb_timer_now_ns();
+    u64 acc = sb_branch_kernel(c->pat[p], PAT_LEN - 1, iters, 1);
+    u64 t1  = sb_timer_now_ns();
+    if (counting && sb_branch_pmu_stop(pmu, out) == SB_OK) { *out_ok = true; }
+    __asm__ volatile("" : : "r"(acc));
+    return (f64)(t1 - t0) / (f64)iters;
+}
 
-    for (size_t i = 0; i < iters; i++) {
-        uint8_t v = pattern[idx];
-        idx = (idx + 1) & (len - 1);
+static f64 time_chain(u64 n) {
+    u64 t0  = sb_timer_now_ns();
+    u64 acc = sb_branch_add_chain(n, 0);
+    u64 t1  = sb_timer_now_ns();
+    __asm__ volatile("" : : "r"(acc));
+    return (f64)(t1 - t0) / ((f64)n * SB_BRANCH_CHAIN_LEN);
+}
 
-        forced_branch(v, &acc);
-        __asm__ volatile("" : "+r"(acc));
+static u64 iters_for(f64 ns_per_iter, u64 target_ns) {
+    if (ns_per_iter <= 0) { return CALIB_ITERS; }
+    f64 n = (f64)target_ns / ns_per_iter;
+    return n < (f64)CALIB_ITERS ? CALIB_ITERS : (u64)n;
+}
+
+/* Runs on its own thread so placement (QoS / affinity) and the per-thread
+ * counters do not leak into the main thread. */
+static void *measure(void *arg) {
+    bench_ctx *c = arg;
+    sb_thread_place_self(SB_CORE_PERF, 0);
+
+    sb_branch_pmu pmu;
+    c->pmu_ok = sb_branch_pmu_init(&pmu) == SB_OK;
+    if (c->pmu_ok) { c->pmu_name = pmu.name; }
+    else           { snprintf(c->pmu_reason, sizeof(c->pmu_reason), "%s", pmu.reason); }
+    sb_branch_pmu *pp = c->pmu_ok ? &pmu : NULL;
+
+    sb_timer_spin(SB_WARMUP_NS);
+
+    /* Calibration doubles as warmup of each stream (L2-resident, 1 MiB each). */
+    sb_branch_pmu_counts cnt;
+    bool ok;
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        f64 ns = time_pattern(c, (pat_e)p, CALIB_ITERS, NULL, &cnt, &ok);
+        c->iters[p]    = iters_for(ns, TRIAL_NS);
+        c->ns[p]       = 1e30;
+        c->count_ns[p] = 1e30;
     }
+    u64 chain_n = iters_for(time_chain(100'000) * SB_BRANCH_CHAIN_LEN, CHAIN_NS);
+    c->add_ns = 1e30;
 
-    return acc;
-}
-
-static double time_branchy_ns(const uint8_t *pattern, size_t len, size_t iters) {
-    uint64_t t0 = timer_ns();
-    uint64_t acc = run_branchy(pattern, len, iters, 1);
-    uint64_t t1 = timer_ns();
-    __asm__ volatile("" : "+r"(acc));
-    if (t1 <= t0) return -1;
-    return (double)(t1 - t0) / (double)iters;
-}
-
-static double time_branchy_with_perf_ns(const uint8_t *pattern, size_t len,
-                                        size_t iters, struct branch_perf *perf,
-                                        uint64_t *branches, uint64_t *misses,
-                                        int *have_counters) {
-    uint64_t acc;
-    uint64_t t0;
-    uint64_t t1;
-
-    *branches = 0;
-    *misses = 0;
-    *have_counters = 0;
-
-    t0 = timer_ns();
-    int counters_started = branch_perf_start(perf);
-    acc = run_branchy(pattern, len, iters, 1);
-    if (counters_started && branch_perf_stop(perf, branches, misses))
-        *have_counters = 1;
-    t1 = timer_ns();
-
-    __asm__ volatile("" : "+r"(acc));
-    if (t1 <= t0) return -1;
-    return (double)(t1 - t0) / (double)iters;
-}
-
-static size_t calibrate_branch_iters(const uint8_t *pattern, size_t len) {
-    size_t iters = 1000000;
-    double ns = time_branchy_ns(pattern, len, iters);
-    if (ns <= 0) return iters;
-
-    size_t target = (size_t)((double)BRANCH_TARGET_NS / ns);
-    if (target < iters) target = iters;
-    return target;
-}
-
-static struct branch_result measure_case(const struct branch_case *c,
-                                         uint8_t *pattern, size_t len,
-                                         double baseline_ns,
-                                         struct branch_perf *perf) {
-    struct branch_result r = {-1, -1, -1, 0, 0, 0, 0};
-    fill_pattern(pattern, len, c->pattern);
-
-    size_t iters = calibrate_branch_iters(pattern, len);
-    run_branchy(pattern, len, len * 2, 1);
-
-    double best_branch = 1e30;
-    uint64_t best_branches = 0;
-    uint64_t best_misses = 0;
-    int best_have_counters = 0;
-
-    for (int trial = 0; trial < BRANCH_TRIALS; trial++) {
-        uint64_t branches = 0;
-        uint64_t misses = 0;
-        int have_counters = 0;
-        double ns = time_branchy_with_perf_ns(pattern, len, iters, perf,
-                                             &branches, &misses, &have_counters);
-        if (ns > 0 && ns < best_branch) {
-            best_branch = ns;
-            best_branches = branches;
-            best_misses = misses;
-            best_have_counters = have_counters;
+    /* Interleave patterns so slow clock drift hits all of them alike. */
+    for (u32 r = 0; r < ROUNDS; r++) {
+        f64 a = time_chain(chain_n);
+        if (a > 0 && a < c->add_ns) { c->add_ns = a; }
+        for (u32 p = 0; p < PAT_COUNT; p++) {
+            f64 ns = time_pattern(c, (pat_e)p, c->iters[p], pp, &cnt, &ok);
+            if (ns > 0 && ns < c->ns[p]) { c->ns[p] = ns; }
+            if (ok && ns > 0 && ns < c->count_ns[p]) {
+                c->count_ns[p]    = ns;
+                c->counts[p]      = cnt;
+                c->have_counts[p] = true;
+            }
         }
     }
 
-    if (best_branch >= 1e29)
-        return r;
-
-    r.branch_ns = best_branch;
-    r.extra_ns = best_branch - baseline_ns;
-    if (r.extra_ns < 0) r.extra_ns = 0;
-    r.hw_branches = best_branches;
-    r.hw_misses = best_misses;
-    r.logical_branches = iters;
-    r.have_counters = best_have_counters;
-    if (r.have_counters && r.hw_misses > 0) {
-        double misses_per_logical_branch =
-            (double)r.hw_misses / (double)r.logical_branches;
-        r.penalty_ns = r.extra_ns / misses_per_logical_branch;
-    } else {
-        r.penalty_ns = c->expected_miss_rate > 0 ? r.extra_ns / c->expected_miss_rate : 0;
+    if (c->pmu_ok) { sb_branch_pmu_free(&pmu); }
+    c->status = SB_OK;
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        if (c->ns[p] >= 1e29) { c->status = SB_ERR_RANGE; }
     }
-    return r;
+    if (c->add_ns >= 1e29) { c->status = SB_ERR_RANGE; }
+    return NULL;
 }
 
-void bench_branch(void) {
-    static const struct branch_case cases[] = {
-        {"Always true",  PATTERN_ALWAYS_TAKEN, 0.0},
-        {"Alternating",  PATTERN_ALTERNATING,  0.0},
-        {"Periodic 1/8", PATTERN_PERIODIC_8,   0.0},
-        {"Periodic 1/64", PATTERN_PERIODIC_64, 0.0},
-        {"Random 50/50", PATTERN_RANDOM_50,    0.5},
-        {"Random 90/10", PATTERN_RANDOM_90,    0.1},
-        {"Random 99/1",  PATTERN_RANDOM_99,    0.01},
-    };
-    struct branch_perf perf = branch_perf_open();
+/* Per-iteration rates derived from either counters or timing. */
+typedef struct {
+    bool counted;          /* misses (and maybe cycles) come from the PMU */
+    bool counted_cycles;
+    f64  ghz;              /* add-chain clock estimate */
+    f64  extra_ns[PAT_COUNT];
+    f64  miss[PAT_COUNT];  /* misses/iteration above the baseline (counted mode) */
+    f64  extra_cyc[PAT_COUNT];
+} derived;
 
-    uint8_t *pattern = malloc(BRANCH_PATTERN_LEN);
-    printf("=== Branch Prediction ===\n");
-    printf("  Pattern length: %s outcomes\n", fmt_size(BRANCH_PATTERN_LEN));
-#ifdef __linux__
-    if (!perf.ok)
-        printf("  Hardware counters unavailable; using assumed miss rates.\n");
-#else
-    printf("  Hardware counters unavailable on this OS; using assumed miss rates.\n");
-#endif
-    printf("%-16s %12s %12s %10s %12s %12s %12s %12s\n",
-           "Pattern", "Branch", "Extra", "Assumed", "HW branches",
-           "HW misses", "Miss/logical", "Penalty");
-    printf("%-16s %12s %12s %10s %12s %12s %12s %12s\n",
-           "-------", "------", "-----", "-------", "-----------",
-           "---------", "---------", "-------");
+static void derive(const bench_ctx *c, derived *d) {
+    memset(d, 0, sizeof(*d));
+    d->ghz = 1.0 / c->add_ns;
+    f64 base_ns = (c->ns[PAT_TAKEN] + c->ns[PAT_NOT_TAKEN]) / 2.0;
+    for (u32 p = 0; p < PAT_COUNT; p++) { d->extra_ns[p] = c->ns[p] - base_ns; }
 
-    if (!pattern) {
-        printf("  Failed to allocate pattern buffer\n");
-        branch_perf_close(&perf);
-        return;
+    d->counted = c->pmu_ok;
+    for (u32 p = 0; p < PAT_COUNT; p++) { d->counted = d->counted && c->have_counts[p]; }
+    if (!d->counted) { return; }
+
+    f64 miss[PAT_COUNT];
+    f64 cyc[PAT_COUNT];
+    d->counted_cycles = true;
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        miss[p] = (f64)c->counts[p].misses / (f64)c->iters[p];
+        cyc[p]  = (f64)c->counts[p].cycles / (f64)c->iters[p];
+        d->counted_cycles = d->counted_cycles && c->counts[p].has_cycles;
     }
+    f64 base_miss = (miss[PAT_TAKEN] + miss[PAT_NOT_TAKEN]) / 2.0;
+    f64 base_cyc  = (cyc[PAT_TAKEN] + cyc[PAT_NOT_TAKEN]) / 2.0;
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        d->miss[p]      = miss[p] - base_miss;
+        d->extra_cyc[p] = cyc[p] - base_cyc;
+    }
+}
 
-    struct branch_result baseline =
-        measure_case(&cases[0], pattern, BRANCH_PATTERN_LEN, 0, &perf);
-    double baseline_ns = baseline.branch_ns > 0 ? baseline.branch_ns : 0;
-
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        struct branch_result r = measure_case(&cases[i], pattern, BRANCH_PATTERN_LEN,
-                                              baseline_ns, &perf);
-        if (r.branch_ns < 0) {
-            printf("%-16s %12s %12s %10s %12s %12s %12s %12s\n",
-                   cases[i].name, "error", "error", "error", "error",
-                   "error", "error", "error");
+static void report_counts(const bench_ctx *c, const derived *d, f64 taken_pen_ns) {
+    sb_report_group("Mispredicts per 1000 iterations");
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        if (d->counted) {
+            f64 total = (f64)c->counts[p].misses / (f64)c->iters[p];
+            sb_report_value(pats[p].name, 1000.0 * total, "/1k iter", SB_KIND_MEASURED);
+        } else if (pats[p].random) {
+            sb_report_value(pats[p].name, 1000.0 * c->assumed[p], "/1k iter", SB_KIND_ESTIMATE);
+        } else if (taken_pen_ns > 0) {
+            sb_report_value(pats[p].name, 1000.0 * d->extra_ns[p] / taken_pen_ns, "/1k iter",
+                            SB_KIND_ESTIMATE);
         } else {
-            char assumed[32];
-            char hw_branches[32];
-            char hw_misses[32];
-            char logical_miss_rate[32];
-            char penalty[32];
-
-            if (cases[i].expected_miss_rate > 0)
-                snprintf(assumed, sizeof(assumed), "%.1f%%",
-                         cases[i].expected_miss_rate * 100.0);
-            else
-                snprintf(assumed, sizeof(assumed), "%s", "learned");
-
-            if (r.have_counters && r.hw_branches > 0) {
-                snprintf(hw_branches, sizeof(hw_branches), "%llu",
-                         (unsigned long long)r.hw_branches);
-                snprintf(hw_misses, sizeof(hw_misses), "%llu",
-                         (unsigned long long)r.hw_misses);
-                snprintf(logical_miss_rate, sizeof(logical_miss_rate), "%.2f%%",
-                         100.0 * (double)r.hw_misses /
-                         (double)r.logical_branches);
-            } else {
-                snprintf(hw_branches, sizeof(hw_branches), "%s", "n/a");
-                snprintf(hw_misses, sizeof(hw_misses), "%s", "n/a");
-                snprintf(logical_miss_rate, sizeof(logical_miss_rate), "%s", "n/a");
-            }
-
-            if ((r.have_counters && r.hw_misses > 0) ||
-                (!r.have_counters && cases[i].expected_miss_rate > 0)) {
-                snprintf(penalty, sizeof(penalty), "%.2f ns", r.penalty_ns);
-            } else {
-                snprintf(penalty, sizeof(penalty), "%s", "n/a");
-            }
-
-            printf("%-16s %8.2f ns %8.2f ns %10s %12s %12s %12s %12s\n",
-                   cases[i].name, r.branch_ns, r.extra_ns, assumed,
-                   hw_branches, hw_misses, logical_miss_rate, penalty);
+            sb_report_error(pats[p].name, SB_ERR_RANGE);
         }
-        fflush(stdout);
+    }
+}
+
+static void report_penalties(const bench_ctx *c, const derived *d) {
+    sb_report_group("Mispredict penalty");
+    for (u32 i = 0; i < SB_ARRAY_LEN(penalties); i++) {
+        const penalty_info *pi = &penalties[i];
+        f64 misses = d->counted ? d->miss[pi->pat] : c->assumed[pi->pat];
+        if (misses <= 1e-6 || d->extra_ns[pi->pat] <= 0) {
+            sb_report_error(pi->name, SB_ERR_RANGE);
+            sb_report_error(pi->name, SB_ERR_RANGE);
+            continue;
+        }
+        f64 pen_ns = d->extra_ns[pi->pat] / misses;
+        sb_report_value(pi->name, pen_ns, "ns", d->counted ? SB_KIND_MEASURED : SB_KIND_ESTIMATE);
+        if (d->counted_cycles) {
+            sb_report_value(pi->name, d->extra_cyc[pi->pat] / misses, "cycles", SB_KIND_MEASURED);
+        } else {
+            sb_report_value(pi->name, pen_ns * d->ghz, "cycles", SB_KIND_ESTIMATE);
+        }
+    }
+    sb_report_value("Clock (dependent add chain)", d->ghz, "GHz", SB_KIND_ESTIMATE);
+}
+
+static void report_info(const bench_ctx *c, const derived *d) {
+    char size[32];
+    sb_report_info("Kernel: asm loop with one measured branch per iteration; both outcomes run");
+    sb_report_info("  3 instructions with 1 taken branch (3 branches/iter incl. loop back-edge)");
+    sb_report_info("Streams: %s outcomes each (splitmix64), best of %u interleaved trials",
+                   sb_fmt_size(PAT_LEN, size, sizeof(size)), ROUNDS);
+    sb_report_info("Extra time is measured against the always/never-taken mean");
+    if (d->counted) {
+        f64 br = (f64)c->counts[PAT_TAKEN].branches / (f64)c->iters[PAT_TAKEN];
+        sb_report_info("Counters: %s, %.2f branches/iter retired (expect 3)", c->pmu_name, br);
+        sb_report_info("Penalty = extra time (or cycles) / misses above the always/never-taken mean");
+        if (!d->counted_cycles) { sb_report_info("Cycles = ns x clock estimate (no cycle counter)"); }
+    } else {
+        if (c->pmu_ok) { sb_report_info("Counters: %s, but reads were partial (multiplexed?)", c->pmu_name); }
+        else           { sb_report_info("Counters: unavailable (%s)", c->pmu_reason); }
+        sb_report_info("Assumed: random streams miss once per minority outcome (50%%: every");
+        sb_report_info("  other); other miss counts = extra time / taken-branch penalty");
+        sb_report_info("Cycles = ns x clock estimate (dependent adds at 1/cycle)");
+    }
+}
+
+static sb_status_e branch_run(void) {
+    bench_ctx *c = SB_MALLOC(sizeof(*c));
+    if (c == NULL) { return SB_ERR_NOMEM; }
+    memset(c, 0, sizeof(*c));
+
+    sb_status_e s = SB_OK;
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        c->pat[p] = SB_MALLOC(PAT_LEN);
+        if (c->pat[p] == NULL) {
+            s = SB_ERR_NOMEM;
+            goto cleanup;
+        }
+        c->assumed[p] = fill(c->pat[p], (pat_e)p);
     }
 
-    free(pattern);
-    branch_perf_close(&perf);
+    pthread_t t;
+    if (pthread_create(&t, NULL, measure, c) != 0) {
+        s = SB_ERR_SYS;
+        goto cleanup;
+    }
+    pthread_join(t, NULL);
+    if (c->status != SB_OK) {
+        s = c->status;
+        goto cleanup;
+    }
+
+    derived d;
+    derive(c, &d);
+    report_info(c, &d);
+
+    sb_report_group("Time per iteration");
+    for (u32 p = 0; p < PAT_COUNT; p++) {
+        sb_report_value(pats[p].name, 1000.0 * c->ns[p], "ps", SB_KIND_MEASURED);
+    }
+
+    f64 taken_pen_ns = c->assumed[PAT_RAND10] > 0 ? d.extra_ns[PAT_RAND10] / c->assumed[PAT_RAND10] : 0;
+    report_counts(c, &d, taken_pen_ns);
+    report_penalties(c, &d);
+
+cleanup:
+    if (s != SB_OK) { sb_report_error("Branch prediction", s); }
+    for (u32 p = 0; p < PAT_COUNT; p++) { SB_FREE(c->pat[p]); }
+    SB_FREE(c);
+    return s;
 }
+
+const sb_section sb_section_branch = {
+    .name       = "branch",
+    .title      = "Branch Prediction",
+    .help       = "  One data-dependent branch per iteration of an inline-asm loop, fed\n"
+                  "  from 1 MiB outcome streams. Both outcomes run the same instructions\n"
+                  "  and taken branches, so extra time over the always/never-taken mean\n"
+                  "  is mispredict cost only. Miss counts come from Linux perf_event or\n"
+                  "  macOS kperf (root only); otherwise they are estimates. Penalties are\n"
+                  "  split by direction (a usually-taken branch costs more to miss on\n"
+                  "  Apple M4) and given in ns and cycles (clock from a dependent add chain).\n",
+    .run        = branch_run,
+    .repeatable = true,
+};
