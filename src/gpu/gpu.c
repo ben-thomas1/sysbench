@@ -178,13 +178,14 @@ static sb_status_e build_chain(u64 bytes, u32 **out) {
     u64 nodes  = bytes / SB_GPU_LAT_STRIDE;
     u32 stride = SB_GPU_LAT_STRIDE / 4;
     if (nodes < 2 || bytes / 4 > UINT32_MAX) { return SB_ERR_INVALID; }
-    u32 *words = calloc(bytes / 4, sizeof(u32));
+    u32 *words = SB_MALLOC((size_t)bytes);
     u32 *perm  = SB_MALLOC(nodes * sizeof(u32));
     if (words == NULL || perm == NULL) {
         SB_FREE(words);
         SB_FREE(perm);
         return SB_ERR_NOMEM;
     }
+    memset(words, 0, (size_t)bytes);
     for (u64 i = 0; i < nodes; i++) { perm[i] = (u32)i; }
     u64 seed = 0x5EED5EEDULL ^ bytes;
     for (u64 i = nodes - 1; i > 0; i--) {

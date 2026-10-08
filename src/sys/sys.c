@@ -256,7 +256,7 @@ static sb_status_e measure_shm_handoff(f64 *out_ns) {
      * unrelated data shares it. */
     size_t line = sb_platform_get()->cache_line;
     if (line < 64 || (line & (line - 1)) != 0) { line = 128; }
-    void *mem = aligned_alloc(line, line);
+    void *mem = SB_ALIGNED_ALLOC(line, line);
     if (mem == NULL) { return SB_ERR_NOMEM; }
     _Atomic u64 *flag = mem;
     atomic_init(flag, 0);
@@ -267,7 +267,7 @@ static sb_status_e measure_shm_handoff(f64 *out_ns) {
     pthread_t   td;
     sb_status_e s = SB_OK;
     if (pthread_create(&tp, NULL, shm_peer, &pa) != 0) {
-        free(mem);
+        SB_ALIGNED_FREE(mem);
         return SB_ERR_SYS;
     }
     if (pthread_create(&td, NULL, shm_driver, &da) != 0) {
@@ -277,7 +277,7 @@ static sb_status_e measure_shm_handoff(f64 *out_ns) {
         pthread_join(td, NULL);
     }
     pthread_join(tp, NULL);
-    free(mem);
+    SB_ALIGNED_FREE(mem);
     if (s != SB_OK) { return s; }
     if (da.status != SB_OK) { return da.status; }
     if (pa.status != SB_OK) { return pa.status; }

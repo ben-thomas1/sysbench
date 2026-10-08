@@ -260,6 +260,8 @@ parameters so the operation count matches the workload.
   Drive/controller caches may still participate. “N threads” rows are N threads
   that each keep one synchronous I/O in flight, not asynchronous queue depth;
   a single QD1 stream underestimates sequential read (use the 4-thread row).
+  “Rand 4K write+flush” rows write for a fixed window and then flush once;
+  the rate includes that flush, but single writes are not made durable.
   Rows marked “durable” include a drive cache flush in the timing:
   `F_FULLFSYNC` on macOS, `fdatasync` on Linux. On macOS, `fsync` and
   `F_BARRIERFSYNC` only reach the drive's volatile cache; those rows are marked

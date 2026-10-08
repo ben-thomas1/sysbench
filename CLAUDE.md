@@ -39,10 +39,9 @@ sysbench/
     │   ├── report.h/.c          sb_report_*: rows with kind tags; --repeat aggregation
     │   ├── stats.h/.c           median/min/max
     │   └── section.h            sb_section descriptor
-    ├── sys/                     rewritten (reference implementation)
-    ├── cpu/ branch/ mem/ gpu/ disk/ net/ matrix/ npu/
-    │                            legacy code; <name>_section.c adapts it to sb_section
-    └── legacy/                  helpers used only by legacy modules; delete when empty
+    └── cpu/ branch/ mem/ gpu/ disk/ sys/ net/ matrix/ npu/
+                                 one directory per section; each defines sb_section_<name>
+                                 (net uses sys/ipc.h for shared ping-pong helpers)
 ```
 
 ## Build
@@ -53,13 +52,12 @@ make release    -O3 -march=native -ffast-math LTO PIE -> ./bench   (ALL reported
 make smoke      Docker x86-64: debug build, AVX2 build+run, SSE2 build+run, AVX-512 compile
 ```
 - Meson options: `-Dmarch=` (default native), `-Dblas=`, `-Dopenvino=`, `-Dopenvino_include=`, `-Dopenvino_libdir=`.
-- Strict warnings (`strict_args`) apply to `core/`, `main.c` and rewritten modules. Legacy modules build with
-  `warning_level=2`. When you rewrite a module, add `c_args: strict_args` to its `meson.build`.
+- Strict warnings (`strict_args`) apply to all project code; every module's `meson.build` must use them.
 - macOS can't use `-fcf-protection` or the `-z` linker flags, so it uses `-mbranch-protection=standard` instead.
 
 ## Writing a section on the core API
 
-Use `src/sys/sys.c` as the template.
+Use `src/sys/sys.c` or `src/disk/disk.c` as a template.
 1. The module directory owns everything: `<name>.h` declares `extern const sb_section sb_section_<name>;`, the sources
    define it, and `meson.build` appends to `module_libs`. Don't edit `main.c` or other modules.
 2. `run()` returns `sb_status_e`. Report results with `sb_report_value(test, value, unit, kind)`, failures with
@@ -68,7 +66,8 @@ Use `src/sys/sys.c` as the template.
 3. Set `.repeatable = true`. Test names must be stable across passes.
 4. Choose the right kind: `SB_KIND_PEAK` (kernel built to saturate a unit), `MEASURED`, `EFFECTIVE` (nominal work /
    time), `ESTIMATE` (depends on an assumption; say which in an info line).
-5. Delete `<name>_section.c` and drop `inc_legacy` / `legacy_lib` from the module's `meson.build` once nothing uses them.
+5. Allocate with `SB_MALLOC`/`SB_FREE`, or `SB_ALIGNED_ALLOC`/`SB_ALIGNED_FREE` for aligned buffers. Code that
+   deliberately measures libc (mem's allocation rows) may call it directly, with a comment saying so.
 
 ## Measurement rules (from FINDINGS §13)
 

@@ -26,4 +26,18 @@ typedef double   f64;
 #define SB_FREE(p)       free(p)
 #endif
 
+/* Aligned allocation (direct I/O buffers, cache-line-sized objects). `align`
+ * must be a power of two and a multiple of sizeof(void *). Release with
+ * SB_ALIGNED_FREE, never SB_FREE, so the pair can be overridden together. */
+#ifndef SB_ALIGNED_ALLOC
+static inline void *sb_aligned_alloc_default_(size_t align, size_t n) {
+    void *p = NULL;
+    return posix_memalign(&p, align, n) == 0 ? p : NULL;
+}
+#define SB_ALIGNED_ALLOC(align, n) sb_aligned_alloc_default_(align, n)
+#endif
+#ifndef SB_ALIGNED_FREE
+#define SB_ALIGNED_FREE(p) free(p)
+#endif
+
 #define SB_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))

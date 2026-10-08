@@ -87,9 +87,7 @@ static u64 io_align(void) {
 }
 
 static u8 *alloc_io_buf(u64 len) {
-    void *p = NULL;
-    if (posix_memalign(&p, (size_t)io_align(), (size_t)len) != 0) { return NULL; }
-    return p;
+    return SB_ALIGNED_ALLOC((size_t)io_align(), (size_t)len);
 }
 
 static sb_status_e io_full(int fd, u8 *buf, u64 len, u64 off, bool write) {
@@ -255,12 +253,12 @@ static sb_status_e file_create(u64 bytes, u64 *rng, int *out_fd) {
 #if !defined(__APPLE__)
     (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
-    free(buf);
+    SB_ALIGNED_FREE(buf);
     *out_fd = fd;
     return SB_OK;
 
 fail:
-    free(buf);
+    SB_ALIGNED_FREE(buf);
     close(fd);
     return s;
 }
@@ -341,8 +339,9 @@ static sb_status_e par_io(int fd, u64 file_bytes, const io_spec *spec, u64 *rng,
     atomic_init(&c.cursor, rng_below(rng, c.nblk) * spec->blk);
     atomic_init(&c.status, (int)SB_OK);
 
-    c.threads = calloc(spec->nthreads, stride);
+    c.threads = SB_MALLOC((size_t)spec->nthreads * stride);  /* nthreads <= SB_MAX_CPUS */
     if (c.threads == NULL) { return SB_ERR_NOMEM; }
+    memset(c.threads, 0, (size_t)spec->nthreads * stride);
     sb_status_e s = SB_OK;
     u32 nbuf = 0;
     for (; nbuf < spec->nthreads; nbuf++) {
@@ -373,8 +372,8 @@ static sb_status_e par_io(int fd, u64 file_bytes, const io_spec *spec, u64 *rng,
         if (s == SB_OK) { *out_ops = r.units_per_sec; }
     }
 
-    for (u32 i = 0; i < nbuf; i++) { free(thread_at(&c, i)->buf); }
-    free(c.threads);
+    for (u32 i = 0; i < nbuf; i++) { SB_ALIGNED_FREE(thread_at(&c, i)->buf); }
+    SB_FREE(c.threads);
     return s;
 }
 
@@ -394,7 +393,7 @@ static sb_status_e seq_write_durable(int fd, u64 bytes, u64 *rng, f64 *out_gbs) 
     }
     if (s == SB_OK) { s = sync_durable(fd); }
     u64 t1 = sb_timer_now_ns();
-    free(buf);
+    SB_ALIGNED_FREE(buf);
     if (s != SB_OK) { return s; }
     if (t1 <= t0) { return SB_ERR_RANGE; }
     *out_gbs = (f64)bytes / (f64)(t1 - t0);
@@ -423,7 +422,7 @@ static sb_status_e sync_latency(int fd, u64 file_bytes, sync_fn sync, u64 window
         n++;
         t1 = sb_timer_now_ns();
     }
-    free(buf);
+    SB_ALIGNED_FREE(buf);
     if (s != SB_OK) { return s; }
     *out_us = (f64)(t1 - t0) / (f64)n / 1000.0;
     return SB_OK;
@@ -494,11 +493,15 @@ static void run_writes(int fd, const disk_cfg *cfg, u64 *rng) {
     report("Seq write 1 MiB QD1, durable", s, gbs, "GB/s");
 
     /* Random writes for the window, then one durable sync. The sync also flushes
-     * the short warmup and the post-window tail, so the rate is slightly low. */
+     * the short warmup and the post-window tail, so the rate is slightly low.
+     * Individual writes are not durable; per-write durable cost is the sync
+     * latency group below. */
+    sb_report_info("Rand write+flush: 4 KiB writes for the window, then one durable flush;");
+    sb_report_info("  the rate includes the flush. Single writes are not made durable.");
     static const struct { const char *name; u32 nthreads; } rows[] = {
-        { "Rand 4K write, 1 thread, durable",   1 },
-        { "Rand 4K write, 4 threads, durable",  4 },
-        { "Rand 4K write, 16 threads, durable", 16 },
+        { "Rand 4K write+flush, 1 thread",   1 },
+        { "Rand 4K write+flush, 4 threads",  4 },
+        { "Rand 4K write+flush, 16 threads", 16 },
     };
     for (size_t i = 0; i < SB_ARRAY_LEN(rows); i++) {
         io_spec spec = {
@@ -600,8 +603,9 @@ const sb_section sb_section_disk = {
         "  8 MiB with 1 thread, 1 MiB with 4 threads; random 4 KiB with 1-32 threads.\n"
         "  \"N threads\" means N synchronous I/Os in flight, not async queue depth.\n"
         "  Writes are durable (F_FULLFSYNC / fdatasync, timed): 1 GiB sequential,\n"
-        "  random 4 KiB with 1/4/16 threads. Sync latency: write + sync per 4 KiB;\n"
-        "  macOS fsync and F_BARRIERFSYNC rows are labelled NOT durable.\n"
+        "  random 4 KiB with 1/4/16 threads followed by one flush. Sync latency:\n"
+        "  write + sync per 4 KiB; macOS fsync and F_BARRIERFSYNC rows are labelled\n"
+        "  NOT durable.\n"
         "  About 3.2 GiB is written per pass; needs 3 GiB free.\n",
     .run        = disk_run,
     .repeatable = true,

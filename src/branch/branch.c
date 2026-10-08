@@ -235,8 +235,10 @@ static void report_counts(const bench_ctx *c, const derived *d, f64 taken_pen_ns
         } else if (pats[p].random) {
             sb_report_value(pats[p].name, 1000.0 * c->assumed[p], "/1k iter", SB_KIND_ESTIMATE);
         } else if (taken_pen_ns > 0) {
-            sb_report_value(pats[p].name, 1000.0 * d->extra_ns[p] / taken_pen_ns, "/1k iter",
-                            SB_KIND_ESTIMATE);
+            /* Baseline patterns sit at the mean, so noise can make extra time
+             * slightly negative; a miss count cannot be. */
+            f64 implied = d->extra_ns[p] > 0 ? d->extra_ns[p] / taken_pen_ns : 0;
+            sb_report_value(pats[p].name, 1000.0 * implied, "/1k iter", SB_KIND_ESTIMATE);
         } else {
             sb_report_error(pats[p].name, SB_ERR_RANGE);
         }

@@ -59,8 +59,7 @@ endif
 add_project_arguments(common_args, language: host == 'darwin' ? ['c', 'objc'] : ['c'])
 add_project_link_arguments(link_args, language: host == 'darwin' ? ['c', 'objc'] : ['c'])
 
-# Strict warnings for code written on the core API. Modules still in legacy
-# form build with warning_level=2 only until they are rewritten.
+# Strict warnings for all project code (-Werror in debug).
 strict_args = [
   '-Wshadow', '-Wconversion', '-Wsign-conversion', '-Wvla', '-Wcast-align',
   '-Wpointer-arith', '-Wwrite-strings', '-Wformat=2', '-Wnull-dereference',
@@ -74,7 +73,6 @@ endif
 # --- Dependencies ------------------------------------------------------------
 threads = dependency('threads')
 inc_src    = include_directories('src')
-inc_legacy = include_directories('src/legacy')
 
 if host == 'darwin'
   metal_dep  = dependency('appleframeworks', modules: ['Metal', 'Foundation'])
@@ -88,7 +86,6 @@ endif
 
 # --- Core + modules ----------------------------------------------------------
 subdir('src/core')
-subdir('src/legacy')
 
 module_libs = []
 foreach m : ['cpu', 'branch', 'gpu', 'mem', 'disk', 'sys', 'net', 'matrix', 'npu']
@@ -99,7 +96,7 @@ executable('bench', 'src/main.c',
   include_directories: inc_src,
   c_args: strict_args,
   link_whole: module_libs,
-  link_with: [core_lib, legacy_lib],
+  link_with: core_lib,
   dependencies: threads,
   install: true,
 )

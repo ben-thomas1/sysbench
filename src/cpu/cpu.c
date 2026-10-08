@@ -43,11 +43,13 @@ static sb_status_e run_kernel(const sb_cpu_kernel *k, const run_cfg *c, f64 *out
     return SB_OK;
 }
 
-static void run_group(const sb_cpu_kernel *ks, u32 nk, const run_cfg *c) {
+/* Runs every kernel on one configuration; vals[i] gets the result or -1. */
+static void run_group(const sb_cpu_kernel *ks, u32 nk, const run_cfg *c, f64 *vals) {
     sb_report_group(c->title);
     for (u32 i = 0; i < nk; i++) {
         char name[64];
         snprintf(name, sizeof(name), "%s %s", ks[i].name, c->tag);
+        vals[i] = -1;
         if (ks[i].fn == NULL) {
             sb_report_skip(name, ks[i].skip);
             continue;
@@ -59,8 +61,29 @@ static void run_group(const sb_cpu_kernel *ks, u32 nk, const run_cfg *c) {
             continue;
         }
         sb_report_value(name, v, ks[i].unit, SB_KIND_PEAK);
+        vals[i] = v;
     }
 }
+
+#if defined(__APPLE__)
+/* macOS can only reach the E-cores at a reduced clock (BACKGROUND QoS), so
+ * estimate their full-clock share as the all-core result minus P-cores only. */
+static void report_ecore_estimate(const sb_cpu_kernel *ks, u32 nk, const f64 *all, const f64 *perf, u32 neff) {
+    char title[64];
+    snprintf(title, sizeof(title), "E-cores at full clock, estimate (all-core - P-cores)");
+    sb_report_group(title);
+    for (u32 i = 0; i < nk; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "%s %uE est", ks[i].name, neff);
+        if (all[i] < 0 || perf[i] < 0) {
+            sb_report_skip(name, "needs the all-core and P-core rows");
+            continue;
+        }
+        f64 d = all[i] - perf[i];
+        sb_report_value(name, d > 0 ? d : 0, ks[i].unit, SB_KIND_ESTIMATE);
+    }
+}
+#endif
 
 static u32 build_configs(const sb_platform *p, run_cfg *out) {
     bool hybrid = p->nperf > 0 && p->neff > 0;
@@ -220,7 +243,8 @@ static sb_status_e cpu_run(void) {
     sb_report_info("Placement: QoS classes, P = USER_INTERACTIVE, E = BACKGROUND; the scheduler picks cores.");
     sb_report_info("E-core rows: macOS runs BACKGROUND threads on the E cluster at a reduced clock");
     sb_report_info("  (~1 GHz measured, 2.6 GHz max) shared with system daemons, so they are not the");
-    sb_report_info("  E-core peak. The E-cores' full-clock share is roughly all-core minus P-cores.");
+    sb_report_info("  E-core peak. The \"E-cores at full clock\" group estimates their share as");
+    sb_report_info("  all-core minus P-cores (the all-core run includes the E-cores at full clock).");
 #else
     sb_report_info("Placement: P/E groups pin one thread per CPU of that type; all-core threads are unpinned.");
 #endif
@@ -235,7 +259,12 @@ static sb_status_e cpu_run(void) {
     if (p->freq_max_hz > 0) { sb_report_info("OS-reported max clock: %.2f GHz", (f64)p->freq_max_hz / 1e9); }
     sb_report_info("Not measured here: matrix units (SME, AMX); see the matrix section.");
 
-    for (u32 i = 0; i < nc; i++) { run_group(ks, nk, &cfgs[i]); }
+    f64 vals[4][SB_CPU_MAX_KERNELS];
+    for (u32 i = 0; i < nc; i++) { run_group(ks, nk, &cfgs[i], vals[i]); }
+#if defined(__APPLE__)
+    /* build_configs order on hybrid CPUs: 1T, all, P, E. */
+    if (nc == 4) { report_ecore_estimate(ks, nk, vals[1], vals[2], p->neff); }
+#endif
     run_ipc();
     return SB_OK;
 }
