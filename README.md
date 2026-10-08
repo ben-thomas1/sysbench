@@ -90,8 +90,8 @@ measures the filesystem containing the repository.
 | GPU | `gpu` | FP32/FP16/INT32, buffer and shared-memory bandwidth, dependent-load latency, texture sampling |
 | Memory | `mem` | Latency and read bandwidth from 4 KiB to 1 GiB; stores, atomics, allocation |
 | Storage | `disk` | Sequential and random 4 KiB direct I/O, 1–32 threads, durable vs non-durable sync latency |
-| System | `sys` | getuid, pipe process handoff, thread create/join |
-| Network | `net` | TCP loopback throughput and one-byte round-trip latency |
+| System | `sys` | getuid and open+close cost, pipe handoff (blocking and busy-poll), shared cache-line handoff, thread create/join |
+| Network | `net` | TCP loopback and Unix socketpair throughput and one-byte round-trip latency (blocking and busy-poll) |
 | Matrix | `matrix` | SGEMM/DGEMM library throughput via Accelerate or OpenBLAS, result-checked |
 | NPU | `npu` | Synchronous inference through Core ML (with placement) or OpenVINO |
 
@@ -223,8 +223,25 @@ parameters so the operation count matches the workload.
   `F_BARRIERFSYNC` only reach the drive's volatile cache; those rows are marked
   NOT durable (about 30× and 3× faster than a real flush on an M4 Pro). Random-write rates
   depend on the drive's internal state and vary by ±30% between runs.
-- Pipe handoff includes pipe syscalls and scheduling. TCP loopback measures
-  the local OS stack, not the network interface.
+- `sys`: getuid is the bare kernel-trap cost; open+close of `/dev/null` is a
+  file path that endpoint-security software hooks, so a large gap between the
+  two points at such software (the section lists active macOS endpoint-security
+  extensions). A handoff is half a one-byte ping-pong round trip. "Blocking"
+  pipe handoffs run between two processes and include putting the reader to
+  sleep and waking it; "busy-poll" spins on `O_NONBLOCK` reads, leaving pipe
+  transport and syscall cost; the shared cache line row is two threads
+  bouncing an atomic, the cross-core floor under any IPC. Ping-pong peers are
+  pinned to two CPUs that are not SMT siblings on Linux and use QoS
+  USER_INTERACTIVE on macOS. Thread create+join covers creation, the first
+  schedule, exit and join of an empty thread.
+- `net` measures the local OS stack, not a network interface: TCP over
+  127.0.0.1, with an `AF_UNIX` socketpair as a non-network reference.
+  Throughput streams 1 MiB writes with default socket buffers (Linux
+  autotuning stays on). RTT rows are one-byte ping-pongs with `TCP_NODELAY`;
+  blocking minus busy-poll is the sleep/wakeup cost. Network-filter software
+  adds to TCP even when busy-polling; on macOS the section lists active
+  network-filter extensions. A busy-poll TCP RTT far above the Unix one points
+  at such a filter.
 - Matrix GFLOPS are library throughput (2n³ / time, median of short batches
   after a warmup), not a hardware peak. The library chooses kernels and
   threads: Accelerate uses the SME matrix unit on M4-class CPUs, OpenBLAS

@@ -1,362 +1,321 @@
-#include "bench.h"
-#include "timer.h"
+#include "net/net.h"
+#include "core/report.h"
+#include "core/timer.h"
+#include "sys/ipc.h"
 
-#include <stdio.h>
+#include <arpa/inet.h>
 #include <errno.h>
-#include <stdint.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#define BW_BLOCK_SIZE  (64 * 1024)  /* 64 KiB */
-#define BW_TOTAL_BYTES (2ULL * 1024 * 1024 * 1024)  /* 2 GiB */
-#define LAT_ITERS      100000
+/* 1 MiB per write()/read(): large enough that syscall cost is amortised
+ * (FINDINGS: 64 KiB and 1 MiB within 10% here), small enough to stay in the
+ * L2. Socket buffers are left at their defaults so Linux TCP autotuning stays
+ * on (setting SO_SNDBUF/SO_RCVBUF disables it). */
+#define BW_IO_BYTES  (1U << 20)
+#define BW_WINDOW_NS 1'000'000'000ULL
 
-static int tcp_socket(void) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct timeval timeout = {.tv_sec = 5};
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
-        int saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
+/* --- Socket setup (outside every timed window) --- */
+
+/* No SO_RCVTIMEO/SO_SNDTIMEO: on macOS they cost ~8% throughput (TCP and
+ * Unix, results/agent-sysnet). A stuck peer is instead woken by shutdown()
+ * on every error path, which makes its blocking read/write return. */
+static void set_nosigpipe(int fd) {
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)fd; /* Linux: SIGPIPE is ignored process-wide in net_run */
+#endif
+}
+
+static sb_status_e set_nodelay(int fd) {
+    int one = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0 ? SB_OK : SB_ERR_SYS;
+}
+
+/* Connected TCP pair over 127.0.0.1: out[0] = accepted side, out[1] = client.
+ * A blocking connect to loopback completes from the listen backlog before
+ * accept() runs, so no helper thread is needed. */
+static sb_status_e tcp_pair(bool nodelay, int out[2]) {
+    sb_status_e s   = SB_ERR_SYS;
+    int         srv = -1;
+    int         cli = -1;
+    int         con = -1;
+
+    struct sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = 0,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t alen = sizeof(addr);
+    int       one  = 1;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) { goto fail; }
+    if (setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) { goto fail; }
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) { goto fail; }
+    if (getsockname(srv, (struct sockaddr *)&addr, &alen) < 0) { goto fail; }
+    if (listen(srv, 1) < 0) { goto fail; }
+
+    cli = socket(AF_INET, SOCK_STREAM, 0);
+    if (cli < 0) { goto fail; }
+    if (connect(cli, (struct sockaddr *)&addr, sizeof(addr)) < 0) { goto fail; }
+
+    struct pollfd pfd = { .fd = srv, .events = POLLIN };
+    int           ready;
+    do { ready = poll(&pfd, 1, (int)(SB_IPC_TIMEOUT_NS / 1'000'000ULL)); } while (ready < 0 && errno == EINTR);
+    if (ready == 0) {
+        s = SB_ERR_TIMEOUT;
+        goto fail;
     }
-    return fd;
+    if (ready < 0) { goto fail; }
+    con = accept(srv, NULL, NULL);
+    if (con < 0) { goto fail; }
+
+    set_nosigpipe(con);
+    set_nosigpipe(cli);
+    if (nodelay && (set_nodelay(con) != SB_OK || set_nodelay(cli) != SB_OK)) { goto fail; }
+    close(srv);
+    out[0] = con;
+    out[1] = cli;
+    return SB_OK;
+
+fail:
+    if (con >= 0) { close(con); }
+    if (cli >= 0) { close(cli); }
+    if (srv >= 0) { close(srv); }
+    return s;
 }
 
-static int accept_client(int srv) {
-    struct pollfd p = {.fd = srv, .events = POLLIN};
-    int ready;
-    do { ready = poll(&p, 1, 5000); } while (ready < 0 && errno == EINTR);
-    if (ready == 0) errno = ETIMEDOUT;
-    if (ready <= 0) return -1;
-    return accept(srv, NULL, NULL);
+static sb_status_e unix_pair(int out[2]) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, out) < 0) { return SB_ERR_SYS; }
+    set_nosigpipe(out[0]);
+    set_nosigpipe(out[1]);
+    return SB_OK;
 }
 
-static int full_read(int fd, void *buf, size_t len) {
-    char *p = (char *)buf;
-    size_t done = 0;
-    while (done < len) {
-        ssize_t n = read(fd, p + done, len - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("read");
-            return -1;
-        }
-        if (n == 0) {
-            fprintf(stderr, "read: unexpected EOF\n");
-            return -1;
-        }
-        done += (size_t)n;
-    }
-    return 0;
+static sb_status_e make_pair(bool tcp, bool nodelay, int out[2]) {
+    return tcp ? tcp_pair(nodelay, out) : unix_pair(out);
 }
 
-static int full_write(int fd, const void *buf, size_t len) {
-    const char *p = (const char *)buf;
-    size_t done = 0;
-    while (done < len) {
-        ssize_t n = write(fd, p + done, len - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("write");
-            return -1;
-        }
-        if (n == 0) {
-            fprintf(stderr, "write: wrote 0 bytes\n");
-            return -1;
-        }
-        done += (size_t)n;
-    }
-    return 0;
-}
+/* --- Throughput: one writer thread streams, the reader thread measures ---
+ * The reader warms up for SB_WARMUP_NS, counts bytes received in a fixed
+ * window, then raises `stop` and drains to EOF so the writer never blocks. */
 
-struct bw_client_arg {
-    int port;
-    uint64_t total_bytes;
-    int ok;
-};
+typedef struct {
+    int          fd;
+    atomic_bool *stop;
+    sb_status_e  status;
+    f64          gbps;
+} bw_arg;
 
-static void *bw_client(void *arg) {
-    struct bw_client_arg *a = (struct bw_client_arg *)arg;
-
-    int fd = tcp_socket();
-    if (fd < 0) { perror("socket"); return NULL; }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(a->port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("connect");
-        close(fd);
+static void *bw_writer(void *p) {
+    bw_arg *a = p;
+    sb_ipc_place(1);
+    char *buf = SB_MALLOC(BW_IO_BYTES);
+    if (buf == NULL) {
+        a->status = SB_ERR_NOMEM;
+        (void)shutdown(a->fd, SHUT_RDWR);
         return NULL;
     }
-
-    char *buf = malloc(BW_BLOCK_SIZE);
-    if (!buf) {
-        close(fd);
-        return NULL;
+    memset(buf, 0xAB, BW_IO_BYTES);
+    a->status = SB_OK;
+    while (!atomic_load_explicit(a->stop, memory_order_relaxed) && a->status == SB_OK) {
+        size_t done = 0;
+        while (done < BW_IO_BYTES) {
+            ssize_t n = write(a->fd, buf + done, BW_IO_BYTES - done);
+            if (n < 0 && errno == EINTR) { continue; }
+            if (n <= 0) {
+                a->status = SB_ERR_IO; /* EPIPE after the reader shut down, or a real error */
+                break;
+            }
+            done += (size_t)n;
+        }
     }
-    memset(buf, 0xAB, BW_BLOCK_SIZE);
-
-    uint64_t sent = 0;
-    while (sent < a->total_bytes) {
-        size_t chunk = BW_BLOCK_SIZE;
-        if (chunk > a->total_bytes - sent)
-            chunk = (size_t)(a->total_bytes - sent);
-        if (full_write(fd, buf, chunk) < 0)
-            break;
-        sent += chunk;
-    }
-
-    a->ok = sent == a->total_bytes;
-    free(buf);
-    close(fd);
+    (void)shutdown(a->fd, SHUT_WR);
+    SB_FREE(buf);
     return NULL;
 }
 
-static double measure_loopback_bw_gbps(void) {
-    int srv = tcp_socket();
-    if (srv < 0) { perror("socket"); return -1; }
-
-    int opt = 1;
-    if (setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt(SO_REUSEADDR)");
-        close(srv);
-        return -1;
+/* Reads until `dur_ns` has passed; returns bytes and elapsed ns. */
+static sb_status_e bw_read_for(int fd, char *buf, u64 dur_ns, u64 *out_bytes, u64 *out_ns) {
+    u64 bytes = 0;
+    u64 t0    = sb_timer_now_ns();
+    u64 t     = t0;
+    while (t - t0 < dur_ns) {
+        ssize_t n = read(fd, buf, BW_IO_BYTES);
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n <= 0) { return SB_ERR_IO; }
+        bytes += (u64)n;
+        t      = sb_timer_now_ns();
     }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = 0;  /* let OS pick port */
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(srv);
-        return -1;
-    }
-
-    socklen_t alen = sizeof(addr);
-    if (getsockname(srv, (struct sockaddr *)&addr, &alen) < 0) {
-        perror("getsockname");
-        close(srv);
-        return -1;
-    }
-    int port = ntohs(addr.sin_port);
-
-    if (listen(srv, 1) < 0) {
-        perror("listen");
-        close(srv);
-        return -1;
-    }
-
-    struct bw_client_arg carg = { .port = port, .total_bytes = BW_TOTAL_BYTES, .ok = 0 };
-    pthread_t client;
-    if (pthread_create(&client, NULL, bw_client, &carg) != 0) {
-        perror("pthread_create");
-        close(srv);
-        return -1;
-    }
-
-    int conn = accept_client(srv);
-    if (conn < 0) {
-        perror("accept");
-        close(srv);
-        pthread_join(client, NULL);
-        return -1;
-    }
-
-    char *buf = malloc(BW_BLOCK_SIZE);
-    if (!buf) {
-        close(conn);
-        close(srv);
-        pthread_join(client, NULL);
-        return -1;
-    }
-    uint64_t total = 0;
-
-    uint64_t t0 = timer_ns();
-    while (total < BW_TOTAL_BYTES) {
-        size_t chunk = BW_BLOCK_SIZE;
-        if (chunk > BW_TOTAL_BYTES - total)
-            chunk = (size_t)(BW_TOTAL_BYTES - total);
-        if (full_read(conn, buf, chunk) < 0)
-            break;
-        total += chunk;
-    }
-    uint64_t t1 = timer_ns();
-
-    free(buf);
-    close(conn);
-    close(srv);
-    pthread_join(client, NULL);
-
-    if (!carg.ok || total != BW_TOTAL_BYTES || t1 <= t0)
-        return -1;
-    return (double)total / ((double)(t1 - t0) / 1e9) / 1e9;
+    *out_bytes = bytes;
+    *out_ns    = t - t0;
+    return SB_OK;
 }
 
-/* --- Loopback latency (TCP ping-pong) --- */
-
-struct lat_client_arg {
-    int port;
-    int iters;
-    int ok;
-};
-
-static void *lat_client(void *arg) {
-    struct lat_client_arg *a = (struct lat_client_arg *)arg;
-
-    int fd = tcp_socket();
-    if (fd < 0) { perror("socket"); return NULL; }
-
-    int opt = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt(TCP_NODELAY)");
-        close(fd);
+static void *bw_reader(void *p) {
+    bw_arg *a = p;
+    sb_ipc_place(0);
+    char *buf = SB_MALLOC(BW_IO_BYTES);
+    if (buf == NULL) {
+        a->status = SB_ERR_NOMEM;
+        atomic_store(a->stop, true);
+        (void)shutdown(a->fd, SHUT_RDWR);
         return NULL;
     }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(a->port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("connect");
-        close(fd);
-        return NULL;
-    }
-
-    char byte = 'x';
-    for (int i = 0; i < a->iters; i++) {
-        if (full_write(fd, &byte, 1) < 0 ||
-            full_read(fd, &byte, 1) < 0) {
-            close(fd);
-            return NULL;
+    memset(buf, 0, BW_IO_BYTES);
+    u64 bytes = 0;
+    u64 ns    = 0;
+    a->status = bw_read_for(a->fd, buf, SB_WARMUP_NS, &bytes, &ns);
+    if (a->status == SB_OK) { a->status = bw_read_for(a->fd, buf, BW_WINDOW_NS, &bytes, &ns); }
+    atomic_store(a->stop, true);
+    if (a->status != SB_OK) {
+        (void)shutdown(a->fd, SHUT_RDWR);
+    } else {
+        for (;;) { /* drain to the writer's EOF */
+            ssize_t n = read(a->fd, buf, BW_IO_BYTES);
+            if (n < 0 && errno == EINTR) { continue; }
+            if (n <= 0) { break; }
         }
+        if (ns == 0) { a->status = SB_ERR_RANGE; }
+        else         { a->gbps = (f64)bytes / (f64)ns; }
     }
-
-    a->ok = 1;
-    close(fd);
+    SB_FREE(buf);
     return NULL;
 }
 
-static double measure_loopback_latency_us(void) {
-    int srv = tcp_socket();
-    if (srv < 0) { perror("socket"); return -1; }
+static sb_status_e measure_bw(bool tcp, f64 *out_gbps) {
+    int fds[2];
+    sb_status_e s = make_pair(tcp, false, fds);
+    if (s != SB_OK) { return s; }
 
-    int opt = 1;
-    if (setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt(SO_REUSEADDR)");
-        close(srv);
-        return -1;
+    atomic_bool stop = false;
+    bw_arg      ra   = { .fd = fds[0], .stop = &stop, .status = SB_ERR_SYS };
+    bw_arg      wa   = { .fd = fds[1], .stop = &stop, .status = SB_ERR_SYS };
+    pthread_t   tr;
+    pthread_t   tw;
+    if (pthread_create(&tw, NULL, bw_writer, &wa) != 0) {
+        s = SB_ERR_SYS;
+        goto out;
     }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = 0;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(srv);
-        return -1;
+    if (pthread_create(&tr, NULL, bw_reader, &ra) != 0) {
+        atomic_store(&stop, true);
+        (void)shutdown(fds[0], SHUT_RDWR);
+        pthread_join(tw, NULL);
+        s = SB_ERR_SYS;
+        goto out;
     }
+    pthread_join(tr, NULL);
+    pthread_join(tw, NULL);
+    if (ra.status != SB_OK) { s = ra.status; }
+    else if (wa.status != SB_OK) { s = wa.status; }
+    else { *out_gbps = ra.gbps; }
 
-    socklen_t alen = sizeof(addr);
-    if (getsockname(srv, (struct sockaddr *)&addr, &alen) < 0) {
-        perror("getsockname");
-        close(srv);
-        return -1;
-    }
-    int port = ntohs(addr.sin_port);
-
-    if (listen(srv, 1) < 0) {
-        perror("listen");
-        close(srv);
-        return -1;
-    }
-
-    struct lat_client_arg carg = { .port = port, .iters = LAT_ITERS, .ok = 0 };
-    pthread_t client;
-    if (pthread_create(&client, NULL, lat_client, &carg) != 0) {
-        perror("pthread_create");
-        close(srv);
-        return -1;
-    }
-
-    int conn = accept_client(srv);
-    if (conn < 0) {
-        perror("accept");
-        close(srv);
-        pthread_join(client, NULL);
-        return -1;
-    }
-
-    if (setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt(TCP_NODELAY)");
-        close(conn);
-        close(srv);
-        pthread_join(client, NULL);
-        return -1;
-    }
-
-    char byte;
-    uint64_t t0 = timer_ns();
-    for (int i = 0; i < LAT_ITERS; i++) {
-        if (full_read(conn, &byte, 1) < 0 ||
-            full_write(conn, &byte, 1) < 0) {
-            close(conn);
-            close(srv);
-            pthread_join(client, NULL);
-            return -1;
-        }
-    }
-    uint64_t t1 = timer_ns();
-
-    close(conn);
-    close(srv);
-    pthread_join(client, NULL);
-
-    if (!carg.ok || t1 <= t0)
-        return -1;
-    return (double)(t1 - t0) / LAT_ITERS / 1000.0;
+out:
+    close(fds[0]);
+    close(fds[1]);
+    return s;
 }
 
-/* --- Entry point --- */
+/* --- Latency: one-byte ping-pong between two placed threads --- */
 
-void bench_net(void) {
+static sb_status_e measure_rtt(bool tcp, bool spin, f64 *out_us) {
+    int fds[2];
+    sb_status_e s = make_pair(tcp, true, fds);
+    if (s != SB_OK) { return s; }
+    if (spin && (sb_ipc_set_nonblock(fds[0]) != SB_OK || sb_ipc_set_nonblock(fds[1]) != SB_OK)) {
+        s = SB_ERR_SYS;
+    }
+    f64 rtt_ns = 0;
+    if (s == SB_OK) { s = sb_ipc_pingpong_threads(fds[0], fds[0], fds[1], fds[1], spin, &rtt_ns); }
+    close(fds[0]);
+    close(fds[1]);
+    if (s == SB_OK) { *out_us = rtt_ns / 1000.0; }
+    return s;
+}
+
+/* --- Section --- */
+
+static void report(const char *test, sb_status_e s, f64 v, const char *unit) {
+    if (s == SB_OK) { sb_report_value(test, v, unit, SB_KIND_MEASURED); }
+    else            { sb_report_error(test, s); }
+}
+
+static void info_default_buffers(void) {
+    int fds[2];
+    if (tcp_pair(false, fds) != SB_OK) { return; }
+    int       snd = 0;
+    int       rcv = 0;
+    socklen_t len = sizeof(snd);
+    (void)getsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &snd, &len);
+    len = sizeof(rcv);
+    (void)getsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, &rcv, &len);
+    close(fds[0]);
+    close(fds[1]);
+    sb_report_info("TCP initial buffers: SO_SNDBUF %.0f KiB, SO_RCVBUF %.0f KiB (defaults; autotuning untouched)",
+                   (f64)snd / 1024.0, (f64)rcv / 1024.0);
+}
+
+static void run_family(bool tcp) {
+    const char *bw_name    = tcp ? "TCP throughput" : "Unix throughput";
+    const char *block_name = tcp ? "TCP RTT, blocking (incl. wakeup)" : "Unix RTT, blocking (incl. wakeup)";
+    const char *spin_name  = tcp ? "TCP RTT, busy-poll" : "Unix RTT, busy-poll";
+
+    f64 v = 0;
+    sb_status_e s = measure_bw(tcp, &v);
+    report(bw_name, s, v, "GB/s");
+    s = measure_rtt(tcp, false, &v);
+    report(block_name, s, v, "us/RTT");
+    if (sb_ipc_can_spin()) {
+        s = measure_rtt(tcp, true, &v);
+        report(spin_name, s, v, "us/RTT");
+    } else {
+        sb_report_skip(spin_name, "needs 2 CPUs");
+    }
+}
+
+static sb_status_e net_run(void) {
     signal(SIGPIPE, SIG_IGN);
+    sb_ipc_peers_init();
 
-    printf("=== Network (TCP loopback \xe2\x80\x94 OS stack) ===\n");
-    printf("%-24s %14s\n", "Test", "Result");
-    printf("%-24s %14s\n", "----", "------");
+    sb_report_info("Local OS stack only (127.0.0.1 TCP, AF_UNIX socketpair); no NIC involved");
+    sb_report_info("Throughput: 1 MiB writes/reads, 250 ms warmup + 1 s window");
+    sb_report_info("RTT: 1-byte ping-pong; blocking minus busy-poll = sleep/wakeup cost");
+    sb_report_info("Peers: %s", sb_ipc_peers_desc());
+    info_default_buffers();
+    char exts[256];
+    if (sb_ipc_active_exts("network_extension", exts, sizeof(exts)) > 0) {
+        sb_report_info("Network-filter extensions active: %s", exts);
+        sb_report_info("-> TCP rows include their overhead; compare busy-poll TCP vs Unix RTT");
+    }
 
-    double bw = measure_loopback_bw_gbps();
-    if (bw > 0)
-        printf("%-24s %10.2f GB/s\n", "TCP throughput", bw);
-    else
-        printf("%-24s %14s\n", "TCP throughput", "error");
-    fflush(stdout);
-
-    double lat = measure_loopback_latency_us();
-    if (lat > 0)
-        printf("%-24s %10.2f us/RTT\n", "TCP latency", lat);
-    else
-        printf("%-24s %14s\n", "TCP latency", "error");
-    fflush(stdout);
+    sb_report_group("TCP loopback");
+    run_family(true);
+    sb_report_group("Unix socketpair (non-network reference)");
+    run_family(false);
+    return SB_OK;
 }
+
+const sb_section sb_section_net = {
+    .name       = "net",
+    .title      = "Network (loopback)",
+    .help       = "  Local OS network stack, not NIC throughput. TCP over 127.0.0.1 and an\n"
+                  "  AF_UNIX stream socketpair as a non-network IPC reference.\n"
+                  "  Throughput: one thread streams 1 MiB writes, another reads; bytes per\n"
+                  "  second over a 1 s window after a 250 ms warmup (default socket buffers).\n"
+                  "  RTT: one-byte ping-pong (TCP_NODELAY), blocking (includes sleep/wakeup)\n"
+                  "  and busy-poll (O_NONBLOCK spin, transport only). A busy-poll TCP RTT far\n"
+                  "  above the Unix one points at filter software, not the stack. macOS lists\n"
+                  "  active network-filter system extensions when present.\n",
+    .run        = net_run,
+    .repeatable = true,
+};
