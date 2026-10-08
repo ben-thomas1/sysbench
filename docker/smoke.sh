@@ -10,10 +10,13 @@ meson setup /tmp/b-debug -Ddebug=true -Doptimization=g -Db_sanitize=address,unde
 meson compile -C /tmp/b-debug | grep -E 'error|warning' || true
 [ -x /tmp/b-debug/bench ] || fail=1
 
+step "debug run under ASan/UBSan: sys, net"
+/tmp/b-debug/bench --only sys,net || fail=1
+
 step "release build, -march=native (AVX2 under emulation)"
 meson setup /tmp/b-native --buildtype=release -Db_lto=true -Db_pie=true >/dev/null
 meson compile -C /tmp/b-native >/dev/null || fail=1
-/tmp/b-native/bench --only cpu,branch,gpu,sys,matrix,npu || fail=1
+/tmp/b-native/bench --only cpu,branch,gpu,sys,net,matrix,npu || fail=1
 
 step "release build, -march=x86-64 (SSE2 tier)"
 meson setup /tmp/b-sse2 --buildtype=release -Dmarch=x86-64 >/dev/null
