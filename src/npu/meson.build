@@ -1,13 +1,13 @@
 if host == 'darwin'
   # models/npu_model_info.h (generated, gitignored) overrides fallback/npu_model_info.h.
-  npu_inc = [include_directories('fallback'), inc_src, inc_legacy]
+  npu_inc = [include_directories('fallback'), inc_src]
   if import('fs').is_file(meson.project_source_root() / 'models/npu_model_info.h')
     npu_inc = [include_directories('../../models')] + npu_inc
   endif
-  module_libs += static_library('sb_npu', 'npu_macos.m', 'npu_section.c',
+  module_libs += static_library('sb_npu', 'npu_macos.m',
     include_directories: npu_inc,
-    objc_args: ['-fobjc-arc'],
-    link_with: legacy_lib,
+    objc_args: ['-fobjc-arc'] + strict_args,
+    link_with: core_lib,
     dependencies: coreml_dep,
   )
 else
@@ -28,10 +28,10 @@ else
       ov_deps += [ov_pc, cc.find_library('openvino_c', required: true)]
     endif
   endif
-  module_libs += static_library('sb_npu', 'npu_linux.c', 'npu_section.c',
-    include_directories: [inc_src, inc_legacy],
-    c_args: ov_args,
-    link_with: legacy_lib,
+  module_libs += static_library('sb_npu', 'npu_linux.c',
+    include_directories: inc_src,
+    c_args: strict_args + ov_args,
+    link_with: core_lib,
     dependencies: ov_deps,
   )
 endif

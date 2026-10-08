@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12,<3.13"
+# dependencies = ["coremltools==9.0", "numpy"]
+# ///
 """Generate the macOS Core ML convolution benchmark model.
 
 Requires coremltools and numpy. Linux uses gen_openvino_model.py.
 
-Usage: python3 gen_npu_model.py <output_dir>
+Usage: uv run tools/gen_npu_model.py [--neuralnetwork] <output_dir>
 
 Creates a Conv2D-heavy model designed to saturate NPU hardware:
-  Input: [3, 256, 256]
-  10x Conv2d (3x3) layers with ReLU activations
-  Output: [3, 256, 256]
+  10x Conv2d (3x3) layers with ReLU activations, 3 -> 256 -> ... -> 3 channels
+
+Formats:
+  default          ML Program, FP16 weights, compute and I/O, macOS 13+
+                   -> npu_bench.mlpackage. Input/output: [1, 3, 256, 256] FP16.
+  --neuralnetwork  legacy NeuralNetwork (spec v4) -> npu_bench.mlmodel.
+                   Input/output: [3, 256, 256] FP64 multi-arrays (the builder's
+                   default array type); Core ML converts to the device precision.
+The bench prefers npu_bench.mlpackage and falls back to npu_bench.mlmodel.
+
+Both formats have the same operation count (npu_model_info.h).
 """
 
 import os
@@ -34,7 +46,7 @@ def compute_flops():
 
 
 def gen_coreml(output_dir):
-    """Generate Core ML model using NeuralNetworkBuilder (no BlobWriter needed)."""
+    """Generate the legacy NeuralNetwork model (NeuralNetworkBuilder)."""
     try:
         import coremltools as ct
         from coremltools.models.neural_network import NeuralNetworkBuilder
@@ -99,6 +111,53 @@ def gen_coreml(output_dir):
     return True
 
 
+def gen_mlprogram(output_dir):
+    """Generate an FP16 ML Program (.mlpackage) with the same layers."""
+    try:
+        import coremltools as ct
+        import numpy as np
+        from coremltools.converters.mil import Builder as mb
+        from coremltools.converters.mil.mil import types
+    except ImportError as e:
+        print(f"  Skipping Core ML: {e}")
+        return False
+
+    rng = np.random.RandomState(42)
+    channels = [IN_CH] + [MID_CH] * (NUM_LAYERS - 1) + [IN_CH]
+    weights = []
+    for i in range(NUM_LAYERS):
+        c_in, c_out = channels[i], channels[i + 1]
+        scale = np.sqrt(2.0 / (c_in * KERNEL * KERNEL))
+        # MIL conv weights are (C_out, C_in, H, W).
+        weights.append((rng.randn(c_out, c_in, KERNEL, KERNEL) * scale).astype(np.float16))
+
+    @mb.program(
+        input_specs=[mb.TensorSpec(shape=(1, IN_CH, SPATIAL, SPATIAL), dtype=types.fp16)],
+        opset_version=ct.target.macOS13,
+    )
+    def prog(input):
+        x = input
+        for i in range(NUM_LAYERS):
+            last = i == NUM_LAYERS - 1
+            x = mb.conv(x=x, weight=weights[i], pad_type="same",
+                        name="output" if last else f"conv_{i}")
+            if not last:
+                x = mb.relu(x=x, name=f"relu_{i}")
+            print(f"  Layer {i + 1}/{NUM_LAYERS}: Conv2d({channels[i]}→{channels[i + 1]}, 3x3)")
+        return x
+
+    model = ct.convert(
+        prog,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.macOS13,
+    )
+    path = os.path.join(output_dir, "npu_bench.mlpackage")
+    model.save(path)
+    print(f"  Saved: {path}")
+    return True
+
+
 def write_header(output_dir, flops):
     """Write C header with benchmark constants."""
     path = os.path.join(output_dir, "npu_model_info.h")
@@ -116,11 +175,14 @@ def write_header(output_dir, flops):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <output_dir>", file=sys.stderr)
+    args = sys.argv[1:]
+    mlprogram = "--neuralnetwork" not in args
+    args = [a for a in args if a != "--neuralnetwork"]
+    if len(args) != 1:
+        print(f"Usage: {sys.argv[0]} [--neuralnetwork] <output_dir>", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = sys.argv[1]
+    output_dir = args[0]
     os.makedirs(output_dir, exist_ok=True)
 
     flops = compute_flops()
@@ -130,7 +192,7 @@ def main():
     print()
 
     print("--- Core ML (Apple ANE) ---")
-    if not gen_coreml(output_dir):
+    if not (gen_mlprogram(output_dir) if mlprogram else gen_coreml(output_dir)):
         sys.exit(1)
     print()
 

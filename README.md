@@ -92,8 +92,8 @@ measures the filesystem containing the repository.
 | Storage | `disk` | Sequential and random 4 KiB direct I/O, 1–32 threads, durable vs non-durable sync latency |
 | System | `sys` | getuid, pipe process handoff, thread create/join |
 | Network | `net` | TCP loopback throughput and one-byte round-trip latency |
-| Matrix | `matrix` | FP32 SGEMM via Accelerate or OpenBLAS |
-| NPU | `npu` | Synchronous inference through Core ML or OpenVINO |
+| Matrix | `matrix` | SGEMM/DGEMM library throughput via Accelerate or OpenBLAS, result-checked |
+| NPU | `npu` | Synchronous inference through Core ML (with placement) or OpenVINO |
 
 Missing optional BLAS libraries, NPU runtimes/models, or GPU devices are reported
 and skipped. Benchmarks report errors when a measurement fails.
@@ -106,26 +106,34 @@ their reported TOPS should not be compared directly.
 
 ### macOS: Core ML
 
-The generator is verified with Python 3.12 and coremltools 9.0. This example
-uses [uv](https://docs.astral.sh/uv/getting-started/installation/) to select that
-Python version; newer Python versions may lack native coremltools wheels.
+The generator is verified with Python 3.12 and coremltools 9.0. Its inline
+script metadata pins both, so [uv](https://docs.astral.sh/uv/getting-started/installation/)
+can run it directly (newer Python versions may lack native coremltools wheels):
 
 ```sh
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python coremltools==9.0 numpy
-.venv/bin/python tools/gen_npu_model.py models/
+uv run tools/gen_npu_model.py models/
 make clean
 make release
 ./bench --only npu
 ```
 
-This writes `models/npu_bench.mlmodel` and `models/npu_model_info.h`.
-The model has ten 3×3 convolutions at 256×256 spatial resolution, with 256
-intermediate channels. The generated constants override the tracked fallback
-header. Core ML compiles the model at runtime.
+This writes `models/npu_bench.mlpackage` (an FP16 ML Program, FP16 input and
+output) and `models/npu_model_info.h`. `--neuralnetwork` writes the legacy
+`models/npu_bench.mlmodel` (NeuralNetwork, FP64 input and output) instead; the
+bench uses the `.mlpackage` when present and falls back to the `.mlmodel`.
+Both have ten 3×3 convolutions at 256×256 spatial resolution with 256
+intermediate channels and the same operation count, written to the generated
+header (which overrides the tracked fallback header). Core ML compiles the
+model at runtime.
 
 The rows select CPU + Neural Engine, CPU + GPU, and CPU only. Core ML chooses
-where individual operations execute, so the first two rows allow CPU fallback.
+where individual operations execute, so the first two settings allow CPU
+fallback. On macOS 14.4 and later the section prints the planned device of
+every layer or operation (MLComputePlan) as counts, so fallback is visible.
+TOPS are *effective*: model operations divided by time. Core ML can execute
+fewer operations than the model nominally contains (for example Winograd 3×3
+convolution), so CPU + GPU can exceed the GPU's FMA peak. Latency is the median
+of single synchronous predictions and includes Core ML's input/output handling.
 
 ### Linux: OpenVINO
 
@@ -154,9 +162,11 @@ python3 -m venv .venv
 ```
 
 This writes `models/npu_bench.xml` and `models/npu_bench.bin`: ten 512×512 matrix
-multiplications. The program lists the OpenVINO devices, tries NPU when present,
-and runs a CPU baseline. Use the supplied model parameters so the operation
-count matches the workload.
+multiplications. The program lists the OpenVINO devices, runs NPU and GPU when
+listed, and always runs a CPU baseline, each compiled with the `LATENCY`
+performance hint. TOPS are effective (model operations divided by time), and
+the plugin selects the precision (printed per device). Use the supplied model
+parameters so the operation count matches the workload.
 
 ## Interpreting results
 
@@ -202,5 +212,12 @@ count matches the workload.
   depend on the drive's internal state and vary by ±30% between runs.
 - Pipe handoff includes pipe syscalls and scheduling. TCP loopback measures
   the local OS stack, not the network interface.
+- Matrix GFLOPS are library throughput (2n³ / time, median of short batches
+  after a warmup), not a hardware peak. The library chooses kernels and
+  threads: Accelerate uses the SME matrix unit on M4-class CPUs, OpenBLAS
+  prints its build configuration and thread count (`OPENBLAS_NUM_THREADS`
+  overrides it). The single-thread rows show threading overhead at small
+  sizes. Each result is checked against an FP64 reference outside the timed
+  region; a wrong result replaces the number with `WRONG RESULT`.
 
 [FEATURES.md](FEATURES.md) lists possible additions.
