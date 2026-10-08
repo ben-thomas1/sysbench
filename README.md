@@ -86,7 +86,7 @@ leave its temporary file in `build/`; `make clean` removes build artifacts.
 | Section | Selection | Measurement |
 |---------|-----------|-------------|
 | CPU | `cpu` | Scalar and SIMD multiply/add throughput; single-thread and multicore runs |
-| Branch prediction | `branch` | Forced branches over predictable and random outcome streams |
+| Branch prediction | `branch` | One asm branch over predictable and random outcome streams; mispredict penalty by direction |
 | GPU | `gpu` | FP32/FP16/INT32, buffer and shared-memory bandwidth, dependent-load latency, texture sampling |
 | Memory | `mem` | Latency and read bandwidth from 4 KiB to 1 GiB; stores, atomics, allocation |
 | Storage | `disk` | Sequential I/O, random 4 KiB I/O, concurrent readers, write + fsync latency |
@@ -171,9 +171,19 @@ count matches the workload.
 - IPC is an estimate normalized to a reported maximum clock, or an ADD-loop
   clock calibration that assumes one cycle per dependent ADD. It is not a
   hardware instruction/cycle counter measurement.
-- Branch penalties are estimates from extra elapsed time. Linux uses hardware
-  counters when available for the whole measurement; otherwise the table
-  shows assumed miss rates. Counts include loop and unconditional branches.
+- Branch: both outcomes of the measured branch run the same instructions and
+  one taken branch, so time above the always/never-taken mean is mispredict
+  cost. Each iteration retires 3 branches (measured, path, loop back-edge).
+  Miss counts are measured with Linux perf_event (user space; partial or
+  multiplexed reads are rejected) or macOS kperf when run as root. Otherwise
+  random streams are assumed to miss once per minority outcome, the other
+  counts are implied from the taken-miss penalty, and both are tagged
+  `[estimate]`. Penalties are split by direction: missing a branch that is
+  usually taken costs more on Apple M4 (~21 vs ~14 cycles), which is why the
+  50% stream lands in between. Cycles come from the PMU when counted,
+  otherwise from a dependent add-chain clock estimate. Periodic patterns may
+  or may not be learned depending on the core and even the code layout; read
+  their miss counts rather than assuming either.
 - Memory bandwidth is measured by one thread. The pointer chase uses a fixed
   64-byte stride; cache-line sizes and cache topology differ across machines.
   macOS cache metadata describes the performance cluster; Linux describes CPU 0.
