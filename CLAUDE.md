@@ -8,10 +8,10 @@ the project prefix `sb_` / `SB_`.
 
 The project is mid-rewrite. The goal is numbers that can be trusted.
 
-- **Phase 0 (done):** the Meson build, the core API in `src/core/`, one directory per section, and `sys` rewritten on the
-  core API as the worked example.
-- **Phase 1 (in progress):** each remaining section is rewritten on the core API to fix its measurement defects. Each
-  section is one subagent in its own worktree and branch (`phase1/<section>`), reviewed before it merges to master.
+- **Phase 0 (done):** the Meson build, the core API in `src/core/`, and one directory per section.
+- **Phase 1 (done):** every section rewritten on the core API with its measurement defects fixed (one subagent per
+  section, reviewed and merged). Legacy code is gone. Linux/x86/Vulkan/OpenVINO paths are smoke-tested in Docker
+  only; they still need validation on the user's Linux machines.
 - **Phase 2 (planned):** Tier 2 roofline (arithmetic intensity × working set) and Tier 3 real-world kernels (naive and
   optimised), reported against the Tier 1 peaks.
 
@@ -85,7 +85,7 @@ Use `src/sys/sys.c` or `src/disk/disk.c` as a template.
 - **Timing runs take the machine-wide lock**, so parallel agents don't disturb each other's numbers:
   `lockf -k /Users/bt386671/Code/projects/sysbench-validation/.bench.lock ./bench --only <section>`.
   The same applies to `make smoke` and probe runs. Hold it for at most a few minutes at a time.
-- Commit only on your own branch (`phase1/<section>`). Never push and never touch master.
+- Commit only on your own branch (`<phase>/<topic>`, e.g. `phase2/roofline`). Never push and never touch master.
 - MR contents: before/after numbers vs FINDINGS, hot-loop disassembly, `make smoke` output, debug build clean, and an
   explanation of any remaining gap.
 - Don't edit FINDINGS.md. Put new probe results in `results/agent-<section>/`.
