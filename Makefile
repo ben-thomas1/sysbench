@@ -8,6 +8,13 @@ MESON    ?= meson
 DOCKER   ?= docker
 SMOKE_IMG = sysbench-smoke
 
+# Replace make's built-in CC=cc, but keep environment/command-line overrides.
+ifeq ($(origin CC), default)
+CC = clang
+endif
+CC ?= clang
+export CC
+
 .PHONY: all debug release install smoke clean help
 
 all: debug

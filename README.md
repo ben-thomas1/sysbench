@@ -19,6 +19,11 @@ verified). The build uses Meson and Ninja; `make` targets wrap them:
 | `make smoke` | x86-64 Linux build and run inside Docker (build/run check only) |
 | `make clean` | remove `build/` and the links |
 
+Fresh `make` builds default to Clang. Override it with `make CC=clang-19`
+or by setting `CC` in the environment. Meson caches the compiler for each build
+directory; to switch an existing debug build, run
+`CC=clang meson setup --wipe build/debug`, then `make`.
+
 Pass `-Dmarch=<cpu>` to `meson setup` to target something other than `native`.
 
 ### macOS
