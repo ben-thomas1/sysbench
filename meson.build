@@ -92,11 +92,15 @@ foreach m : ['cpu', 'branch', 'gpu', 'mem', 'disk', 'sys', 'net', 'matrix', 'npu
   subdir('src' / m)
 endforeach
 
-executable('bench', 'src/main.c',
+# user_install (default) puts the binary in ~/.local/bin and ignores --prefix.
+bindir = get_option('user_install') ? import('fs').expanduser('~/.local/bin') : get_option('bindir')
+
+executable('sysbench', 'src/main.c',
   include_directories: inc_src,
   c_args: strict_args + ['-DSB_VERSION="' + meson.project_version() + '"'],
   link_whole: module_libs,
   link_with: core_lib,
   dependencies: threads,
   install: true,
+  install_dir: bindir,
 )

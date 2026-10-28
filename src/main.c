@@ -66,7 +66,7 @@ static void print_names(FILE *f) {
 
 static void usage(void) {
     fprintf(stderr,
-        "Usage: bench [--only <list> | --skip <list>] [--repeat N] [--list] [--help] [--version]\n"
+        "Usage: sysbench [--only <list> | --skip <list>] [--repeat N] [--list] [--help] [--version]\n"
         "\n"
         "  --only <list>  Run only the listed sections (comma-separated)\n"
         "  --skip <list>  Run all sections except the listed ones\n"
@@ -79,8 +79,8 @@ static void usage(void) {
 }
 
 static void detailed_help(void) {
-    printf("bench - system benchmark suite\n\n"
-           "Usage: bench [--only <list> | --skip <list>] [--repeat N] [--list] [--help] [--version]\n"
+    printf("sysbench - system benchmark suite\n\n"
+           "Usage: sysbench [--only <list> | --skip <list>] [--repeat N] [--list] [--help] [--version]\n"
            "Default is a single quick pass of every section. --repeat N runs each\n"
            "section N times and reports median, min and max per result.\n"
            "Values tagged [peak] are hardware ceilings, [effective] are nominal work\n"
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
             detailed_help();
             return 0;
         } else if (strcmp(a, "--version") == 0) {
-            printf("bench %s\n", SB_VERSION);
+            printf("sysbench %s\n", SB_VERSION);
             return 0;
         } else {
             fprintf(stderr, "Unknown option: %s\n", a);

@@ -8,3 +8,5 @@ option('openvino_include', type: 'string', value: '',
   description: 'Linux: OpenVINO include dir, for SDKs without a pkg-config file')
 option('openvino_libdir', type: 'string', value: '',
   description: 'Linux: OpenVINO library dir containing libopenvino_c')
+option('user_install', type: 'boolean', value: true,
+  description: 'Install to ~/.local/bin instead of <prefix>/bin')

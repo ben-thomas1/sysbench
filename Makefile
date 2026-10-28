@@ -1,6 +1,7 @@
 # Helpers around Meson. Build directories live under build/.
 #   make            debug build (sanitizers, strict warnings)  -> ./bench-debug
 #   make release    optimized build used for all reported numbers -> ./bench
+#   make install    release build installed as sysbench (~/.local/bin by default)
 #   make smoke      x86-64 Linux build + run in Docker (AVX2, SSE2, AVX-512 compile)
 #   make clean      remove build/ and the binary links
 
@@ -26,11 +27,11 @@ build/release/build.ninja:
 
 debug: build/debug/build.ninja
 	$(MESON) compile -C build/debug
-	ln -sf build/debug/bench bench-debug
+	ln -sf build/debug/sysbench bench-debug
 
 release: build/release/build.ninja
 	$(MESON) compile -C build/release
-	ln -sf build/release/bench bench
+	ln -sf build/release/sysbench bench
 
 install: release
 	$(MESON) install -C build/release
@@ -43,4 +44,4 @@ clean:
 	rm -rf build bench bench-debug
 
 help:
-	@sed -n '2,6p' Makefile
+	@sed -n '2,7p' Makefile

@@ -16,6 +16,7 @@ verified). The build uses Meson and Ninja; `make` targets wrap them:
 |---------|--------|
 | `make release` | optimized build in `build/release/`, linked as `./bench` — use this for numbers |
 | `make` | debug build with sanitizers and strict warnings, linked as `./bench-debug` |
+| `make install` | release build installed as `sysbench` in `~/.local/bin` (`-Duser_install=false` uses `<prefix>/bin`) |
 | `make smoke` | x86-64 Linux build and run inside Docker (build/run check only) |
 | `make clean` | remove `build/` and the links |
 
