@@ -12,7 +12,6 @@ SMOKE_IMG = sysbench-smoke
 ifeq ($(origin CC), default)
 CC = clang
 endif
-CC ?= clang
 export CC
 
 .PHONY: all debug release install smoke clean help
