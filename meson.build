@@ -94,7 +94,7 @@ endforeach
 
 executable('bench', 'src/main.c',
   include_directories: inc_src,
-  c_args: strict_args,
+  c_args: strict_args + ['-DSB_VERSION="' + meson.project_version() + '"'],
   link_whole: module_libs,
   link_with: core_lib,
   dependencies: threads,

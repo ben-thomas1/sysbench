@@ -66,20 +66,21 @@ static void print_names(FILE *f) {
 
 static void usage(void) {
     fprintf(stderr,
-        "Usage: bench [--only <list> | --skip <list>] [--repeat N] [--list] [--help]\n"
+        "Usage: bench [--only <list> | --skip <list>] [--repeat N] [--list] [--help] [--version]\n"
         "\n"
         "  --only <list>  Run only the listed sections (comma-separated)\n"
         "  --skip <list>  Run all sections except the listed ones\n"
         "  --repeat N     Run each section N times; report median/min/max\n"
         "  --list         List section names\n"
         "  --help         Describe every section\n"
+        "  --version      Print the version\n"
         "\nSections: ");
     print_names(stderr);
 }
 
 static void detailed_help(void) {
     printf("bench - system benchmark suite\n\n"
-           "Usage: bench [--only <list> | --skip <list>] [--repeat N] [--list] [--help]\n"
+           "Usage: bench [--only <list> | --skip <list>] [--repeat N] [--list] [--help] [--version]\n"
            "Default is a single quick pass of every section. --repeat N runs each\n"
            "section N times and reports median, min and max per result.\n"
            "Values tagged [peak] are hardware ceilings, [effective] are nominal work\n"
@@ -134,6 +135,9 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(a, "--help") == 0) {
             detailed_help();
+            return 0;
+        } else if (strcmp(a, "--version") == 0) {
+            printf("bench %s\n", SB_VERSION);
             return 0;
         } else {
             fprintf(stderr, "Unknown option: %s\n", a);
